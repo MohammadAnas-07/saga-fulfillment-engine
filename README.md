@@ -43,6 +43,26 @@ Requires JDK 21 and Maven 3.9+.
 mvn clean install
 ```
 
+## Running the tests
+
+```bash
+mvn test
+```
+
+Unit tests need no infrastructure. Integration tests use Testcontainers and need a
+reachable Docker daemon.
+
+> **Integration tests skip silently when Docker is unreachable.** `BUILD SUCCESS` alone
+> does not mean they ran — check the surefire summary for a non-zero `Skipped` count.
+
+Known issue on the current development machine: Docker Desktop's engine (API 1.55)
+returns a stubbed `400` on `/info` to docker-java, so Testcontainers rejects the
+environment even though the `docker` CLI works normally. Neither `DOCKER_HOST` pointed at
+`npipe:////./pipe/dockerDesktopLinuxEngine` nor pinning `DOCKER_API_VERSION=1.44` helped.
+Likely fixes, in order of preference: upgrade Testcontainers past the version that
+supports API 1.55, or enable *Settings → General → Expose daemon on tcp://localhost:2375*
+in Docker Desktop and set `DOCKER_HOST=tcp://localhost:2375`.
+
 ## Running
 
 Not yet runnable — there is no business logic, and the Kafka/Postgres/Redis compose setup

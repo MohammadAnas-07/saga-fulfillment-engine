@@ -273,8 +273,30 @@ both an explicit failure and a timeout, so `ReleaseInventory` can genuinely arri
 (a transition out of `CONFIRMED` is already invalid) but explicit dedup is still the
 clearer guarantee.
 
-> **Implementation happens in a later chunk.** This section records the requirement so
-> it is not rediscovered late.
+### 6.1 order-service is a special case
+
+`order-service` does **not** need a `processed_message` table, and deliberately does not
+have one. Its two commands both drive the order into a *terminal* status, and the order
+records which status it reached — so the order's own `status` column already is the
+idempotency key. A redelivered `ConfirmOrder` against an order that is already
+`CONFIRMED` is detectably redundant with no extra bookkeeping.
+
+That reasoning does **not** transfer to `inventory-service` or `payment-service`:
+"reserve 3 units" and "charge $40" are not self-describing, so replaying them is
+indistinguishable from a legitimate second request. Those services need the explicit
+dedup table.
+
+`order-service` therefore distinguishes three non-applying outcomes, all logged no-ops
+rather than errors:
+
+| Outcome | Condition |
+| --- | --- |
+| `DUPLICATE_IGNORED` | Order already holds the requested status — plain redelivery. |
+| `CONFLICT_IGNORED` | Order is terminal in the *other* status. A terminal order never flips. |
+| `ORDER_NOT_FOUND` | No such order. Ignored rather than thrown, so the consumer cannot spin on a poison message. |
+
+> **Implementation happens in a later chunk** for the other services. This section records
+> the requirement so it is not rediscovered late.
 
 ---
 
@@ -384,9 +406,13 @@ Update after every chunk.
 - [x] **Chunk 0 — Architecture and scaffolding.** `ARCHITECTURE.md`, root multi-module
       `pom.xml`, six empty skeleton modules, `.gitignore`, `README.md` stub, git init.
       *Branch: `main` (explicitly authorized).*
-- [ ] **Chunk 1 — order-service.** `Order` entity and persistence, REST API for create
-      and read, `PENDING` status, publishes `OrderCreated`. *Branch:
+- [x] **Chunk 1 — order-service.** `Order` entity and persistence, REST API for create
+      and read, `PENDING` status, publishes `OrderCreated`, consumes `ConfirmOrder` /
+      `CancelOrder` with consumer-level idempotency (§6.1). *Branch:
       `feature/order-service`.*
+      **Caveat:** the Testcontainers integration tests are written but have never
+      executed — Docker is unreachable from the dev machine (see README). Only the unit
+      tests are proven green.
 - [ ] **Chunk 2 — saga-orchestrator core.** `Saga` entity, state machine, consumes
       `OrderCreated`, creates saga with deadline, publishes `ReserveInventory`.
 - [ ] **Chunk 3 — inventory-service.** Stock model, reserve and release handlers,
