@@ -259,11 +259,22 @@ Without protection, that means:
 - `payment-service` **double-charges** the customer.
 
 **Requirement:** `inventory-service` and `payment-service` must each track the
-`messageId`s of commands they have already processed, and treat a repeat as a no-op that
-re-publishes the original result rather than redoing the work. The natural
-implementation is a `processed_message` table written **in the same local transaction**
-as the business change, so the dedup record and the effect commit atomically or not at
-all.
+`messageId`s of commands they have already processed. The implementation is a
+`processed_commands` table whose **primary key is the message id**, written **in the same
+local transaction** as the business change, so the dedup record and the effect commit
+atomically or not at all — a marker able to commit without its effect would permanently
+suppress a command that never took place.
+
+**Implemented in `inventory-service` as of Chunk 2.** A duplicate there is a logged no-op
+that does **not** re-publish the original result. If the original reply was genuinely
+lost, the saga stalls and the §4 timeout sweep is what recovers it; re-publishing from a
+stored outcome is a possible refinement, deliberately not built, because it would
+duplicate recovery logic the scheduler already owns.
+
+An application-level "already processed?" lookup is only a fast path for the common case.
+The primary key is the real guarantee: two genuinely concurrent deliveries can both pass
+that lookup, and the second insert then fails, rolling its transaction back so the work is
+never done twice.
 
 The same applies to compensating commands — §4 notes that compensation is reachable from
 both an explicit failure and a timeout, so `ReleaseInventory` can genuinely arrive twice.
@@ -275,7 +286,7 @@ clearer guarantee.
 
 ### 6.1 order-service is a special case
 
-`order-service` does **not** need a `processed_message` table, and deliberately does not
+`order-service` does **not** need a `processed_commands` table, and deliberately does not
 have one. Its two commands both drive the order into a *terminal* status, and the order
 records which status it reached — so the order's own `status` column already is the
 idempotency key. A redelivered `ConfirmOrder` against an order that is already
@@ -420,10 +431,15 @@ Update after every chunk.
       **Caveat:** the Testcontainers integration tests are written but have never
       executed — Docker is unreachable from the dev machine (see README). Only the unit
       tests are proven green.
-- [ ] **Chunk 2 — inventory-service.** Stock model, `ReserveInventory` and
+- [x] **Chunk 2 — inventory-service.** Stock model, `ReserveInventory` and
       `ReleaseInventory` handlers, publishes `InventoryReserved` /
-      `InventoryReservationFailed` / `InventoryReleased`. *Branch:
+      `InventoryReservationFailed` / `InventoryReleased`, **plus its own
+      `processed_commands` dedup** (pulled forward from Chunk 6). *Branch:
       `feature/inventory-service`.*
+      **Caveat:** as with Chunk 1, the Testcontainers integration tests are written but
+      have never executed — Docker is unreachable from the dev machine (see README). Only
+      the unit tests are proven green, and they stub the dedup lookup, so the
+      database-enforced half of the idempotency guarantee is unverified.
 - [ ] **Chunk 3 — payment-service.** Payment record, simulated outcomes, consumes
       `ProcessPayment`, publishes `PaymentCompleted` / `PaymentFailed`. *Branch:
       `feature/payment-service`.*
@@ -434,10 +450,11 @@ Update after every chunk.
       `ProcessPayment` on success, compensation on payment failure, and the
       `STARTED` / `CONFIRMED` / `COMPENSATING` / `CANCELLED` transitions of §3.
       *Branch: `feature/saga-orchestrator`.*
-- [ ] **Chunk 6 — idempotency.** `processed_message` dedup in inventory-service,
-      payment-service, and the orchestrator (§6). Lands before scheduler-service because
-      §4 compensation is reachable from both an explicit failure and a timeout, so the
-      scheduler's correctness depends on these handlers already being idempotent.
+- [ ] **Chunk 6 — idempotency (remaining services).** Dedup in payment-service and the
+      orchestrator (§6). inventory-service's landed early, in Chunk 2. Still ahead of
+      scheduler-service because §4 compensation is reachable from both an explicit failure
+      and a timeout, so the scheduler's correctness depends on these handlers already
+      being idempotent.
 - [ ] **Chunk 7 — scheduler-service.** Timeout sweep, orchestrator query API, Redis
       distributed lock, compensation trigger (§4). *Branch: `feature/scheduler-service`.*
 - [ ] **Chunk 8 — integration test suite.** Testcontainers harness plus all seven
