@@ -9,7 +9,9 @@ import java.util.UUID;
 public record OrderResponse(
         UUID id,
         String userId,
+        String itemSku,
         String item,
+        int quantity,
         BigDecimal amount,
         OrderStatus status,
         Instant createdAt,
@@ -19,7 +21,9 @@ public record OrderResponse(
         return new OrderResponse(
                 order.getId(),
                 order.getUserId(),
+                order.getItemSku(),
                 order.getItem(),
+                order.getQuantity(),
                 order.getAmount(),
                 order.getStatus(),
                 order.getCreatedAt(),

@@ -34,7 +34,9 @@ import org.mockito.junit.jupiter.MockitoExtension;
 class OrderServiceTest {
 
     private static final String USER_ID = "user-1";
+    private static final String ITEM_SKU = "MECH-KB-01";
     private static final String ITEM = "Mechanical keyboard";
+    private static final int QUANTITY = 2;
     private static final BigDecimal AMOUNT = new BigDecimal("49.99");
 
     @Mock
@@ -47,7 +49,7 @@ class OrderServiceTest {
     private OrderService orderService;
 
     private static Order orderIn(OrderStatus status) {
-        Order order = Order.create(USER_ID, ITEM, AMOUNT);
+        Order order = Order.create(USER_ID, ITEM_SKU, ITEM, QUANTITY, AMOUNT);
         if (status != OrderStatus.PENDING) {
             order.transitionTo(status);
         }
@@ -63,20 +65,22 @@ class OrderServiceTest {
         void persistsAsPending() {
             when(orderRepository.save(any(Order.class))).thenAnswer(inv -> inv.getArgument(0));
 
-            Order created = orderService.createOrder(USER_ID, ITEM, AMOUNT);
+            Order created = orderService.createOrder(USER_ID, ITEM_SKU, ITEM, QUANTITY, AMOUNT);
 
             assertThat(created.getStatus()).isEqualTo(OrderStatus.PENDING);
             assertThat(created.getUserId()).isEqualTo(USER_ID);
+            assertThat(created.getItemSku()).isEqualTo(ITEM_SKU);
             assertThat(created.getItem()).isEqualTo(ITEM);
+            assertThat(created.getQuantity()).isEqualTo(QUANTITY);
             assertThat(created.getAmount()).isEqualByComparingTo(AMOUNT);
         }
 
         @Test
-        @DisplayName("publishes OrderCreated carrying orderId, userId, item and amount")
+        @DisplayName("publishes OrderCreated carrying orderId, userId, itemSku, item, quantity and amount")
         void publishesOrderCreatedWithCorrectPayload() {
             when(orderRepository.save(any(Order.class))).thenAnswer(inv -> inv.getArgument(0));
 
-            Order created = orderService.createOrder(USER_ID, ITEM, AMOUNT);
+            Order created = orderService.createOrder(USER_ID, ITEM_SKU, ITEM, QUANTITY, AMOUNT);
 
             ArgumentCaptor<OrderCreatedEvent> captor = ArgumentCaptor.forClass(OrderCreatedEvent.class);
             verify(eventPublisher).publishOrderCreated(captor.capture());
@@ -88,6 +92,20 @@ class OrderServiceTest {
             assertThat(event.amount()).isEqualByComparingTo(AMOUNT);
             assertThat(event.messageId()).isNotNull();
             assertThat(event.occurredAt()).isNotNull();
+
+            // The fields this change exists for: without these the orchestrator has
+            // nothing to put in ReserveInventory.
+            assertThat(event.itemSku()).isEqualTo(ITEM_SKU);
+            assertThat(event.quantity()).isEqualTo(QUANTITY);
+        }
+
+        @Test
+        @DisplayName("rejects a quantity below 1 at the domain boundary, not just at the API")
+        void rejectsNonPositiveQuantity() {
+            org.assertj.core.api.Assertions
+                    .assertThatThrownBy(() -> orderService.createOrder(USER_ID, ITEM_SKU, ITEM, 0, AMOUNT))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("quantity must be at least 1");
         }
     }
 

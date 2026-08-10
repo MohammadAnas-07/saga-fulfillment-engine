@@ -25,7 +25,8 @@ public class OrderController {
 
     @PostMapping
     public ResponseEntity<OrderResponse> createOrder(@Valid @RequestBody CreateOrderRequest request) {
-        Order order = orderService.createOrder(request.userId(), request.item(), request.amount());
+        Order order = orderService.createOrder(
+                request.userId(), request.itemSku(), request.item(), request.quantity(), request.amount());
         return ResponseEntity
                 .created(URI.create("/orders/" + order.getId()))
                 .body(OrderResponse.from(order));

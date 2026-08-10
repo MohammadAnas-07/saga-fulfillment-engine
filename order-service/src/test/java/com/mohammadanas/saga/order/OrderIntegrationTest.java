@@ -135,8 +135,8 @@ class OrderIntegrationTest {
     @Test
     @DisplayName("POST /orders persists a PENDING order and publishes OrderCreated to Kafka")
     void createOrderPersistsAndPublishes() throws Exception {
-        CreateOrderRequest request =
-                new CreateOrderRequest("user-42", "Mechanical keyboard", new BigDecimal("49.99"));
+        CreateOrderRequest request = new CreateOrderRequest(
+                "user-42", "MECH-KB-01", "Mechanical keyboard", 2, new BigDecimal("49.99"));
 
         ResponseEntity<OrderResponse> response =
                 restTemplate.postForEntity("/orders", request, OrderResponse.class);
@@ -149,6 +149,8 @@ class OrderIntegrationTest {
         Order persisted = orderRepository.findById(body.id()).orElseThrow();
         assertThat(persisted.getStatus()).isEqualTo(OrderStatus.PENDING);
         assertThat(persisted.getUserId()).isEqualTo("user-42");
+        assertThat(persisted.getItemSku()).isEqualTo("MECH-KB-01");
+        assertThat(persisted.getQuantity()).isEqualTo(2);
         assertThat(persisted.getCreatedAt()).isNotNull();
 
         OrderCreatedEvent event = awaitOrderCreated(body.id());
@@ -156,12 +158,27 @@ class OrderIntegrationTest {
         assertThat(event.item()).isEqualTo("Mechanical keyboard");
         assertThat(event.amount()).isEqualByComparingTo(new BigDecimal("49.99"));
         assertThat(event.messageId()).isNotNull();
+        assertThat(event.itemSku()).isEqualTo("MECH-KB-01");
+        assertThat(event.quantity()).isEqualTo(2);
+    }
+
+    @Test
+    @DisplayName("POST /orders rejects a missing itemSku or a quantity below 1")
+    void rejectsInvalidRequests() {
+        ResponseEntity<String> missingSku = restTemplate.postForEntity("/orders",
+                new CreateOrderRequest("user-9", "  ", "Desk mat", 1, new BigDecimal("19.00")), String.class);
+        assertThat(missingSku.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+
+        ResponseEntity<String> zeroQuantity = restTemplate.postForEntity("/orders",
+                new CreateOrderRequest("user-9", "DESK-MAT-01", "Desk mat", 0, new BigDecimal("19.00")), String.class);
+        assertThat(zeroQuantity.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
     }
 
     @Test
     @DisplayName("GET /orders/{id} returns the order, and 404 for an unknown id")
     void getOrder() {
-        Order saved = orderRepository.save(Order.create("user-7", "Desk mat", new BigDecimal("19.00")));
+        Order saved = orderRepository.save(
+                Order.create("user-7", "DESK-MAT-01", "Desk mat", 1, new BigDecimal("19.00")));
 
         ResponseEntity<OrderResponse> found =
                 restTemplate.getForEntity("/orders/" + saved.getId(), OrderResponse.class);
@@ -177,7 +194,8 @@ class OrderIntegrationTest {
     @Test
     @DisplayName("a ConfirmOrder command from the orchestrator sets the order CONFIRMED")
     void confirmOrderCommandUpdatesStatus() {
-        Order saved = orderRepository.save(Order.create("user-1", "Monitor arm", new BigDecimal("89.00")));
+        Order saved = orderRepository.save(
+                Order.create("user-1", "MON-ARM-01", "Monitor arm", 1, new BigDecimal("89.00")));
 
         kafkaTemplate.send(OrderTopics.CONFIRM_ORDER, saved.getId().toString(),
                 new ConfirmOrderCommand(UUID.randomUUID(), UUID.randomUUID(), saved.getId()));
@@ -188,7 +206,8 @@ class OrderIntegrationTest {
     @Test
     @DisplayName("a CancelOrder command from the orchestrator sets the order CANCELLED")
     void cancelOrderCommandUpdatesStatus() {
-        Order saved = orderRepository.save(Order.create("user-2", "USB hub", new BigDecimal("25.50")));
+        Order saved = orderRepository.save(
+                Order.create("user-2", "USB-HUB-01", "USB hub", 1, new BigDecimal("25.50")));
 
         kafkaTemplate.send(OrderTopics.CANCEL_ORDER, saved.getId().toString(),
                 new CancelOrderCommand(UUID.randomUUID(), UUID.randomUUID(), saved.getId()));
@@ -199,7 +218,8 @@ class OrderIntegrationTest {
     @Test
     @DisplayName("a redelivered ConfirmOrder is a no-op and does not kill the consumer")
     void redeliveredConfirmOrderIsIgnored() {
-        Order saved = orderRepository.save(Order.create("user-3", "Cable tray", new BigDecimal("15.00")));
+        Order saved = orderRepository.save(
+                Order.create("user-3", "CBL-TRAY-01", "Cable tray", 1, new BigDecimal("15.00")));
         UUID sagaId = UUID.randomUUID();
 
         ConfirmOrderCommand command =
@@ -213,7 +233,8 @@ class OrderIntegrationTest {
 
         // Still CONFIRMED, and — the real assertion — the listener is still alive
         // afterwards, proving the duplicate was not a poison pill.
-        Order followUp = orderRepository.save(Order.create("user-3", "Lamp", new BigDecimal("30.00")));
+        Order followUp = orderRepository.save(
+                Order.create("user-3", "LAMP-01", "Lamp", 1, new BigDecimal("30.00")));
         kafkaTemplate.send(OrderTopics.CONFIRM_ORDER, followUp.getId().toString(),
                 new ConfirmOrderCommand(UUID.randomUUID(), UUID.randomUUID(), followUp.getId()));
 
