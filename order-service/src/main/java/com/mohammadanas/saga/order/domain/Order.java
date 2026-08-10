@@ -27,8 +27,20 @@ public class Order {
     @Column(name = "user_id", nullable = false, updatable = false)
     private String userId;
 
+    /**
+     * The inventory item this order is for, in the same identifier space as
+     * inventory-service's {@code itemId}. This is what {@code ReserveInventory} carries;
+     * {@link #item} is display text and is never used to look up stock.
+     */
+    @Column(name = "item_sku", nullable = false, updatable = false)
+    private String itemSku;
+
+    /** Free-text description for display. Not an inventory key. */
     @Column(nullable = false, updatable = false)
     private String item;
+
+    @Column(nullable = false, updatable = false)
+    private int quantity;
 
     @Column(nullable = false, updatable = false, precision = 19, scale = 2)
     private BigDecimal amount;
@@ -49,17 +61,23 @@ public class Order {
         // for JPA
     }
 
-    private Order(UUID id, String userId, String item, BigDecimal amount, OrderStatus status) {
+    private Order(UUID id, String userId, String itemSku, String item, int quantity,
+            BigDecimal amount, OrderStatus status) {
         this.id = id;
         this.userId = userId;
+        this.itemSku = itemSku;
         this.item = item;
+        this.quantity = quantity;
         this.amount = amount;
         this.status = status;
     }
 
     /** Creates a new order in {@link OrderStatus#PENDING}, the only valid entry state. */
-    public static Order create(String userId, String item, BigDecimal amount) {
-        return new Order(UUID.randomUUID(), userId, item, amount, OrderStatus.PENDING);
+    public static Order create(String userId, String itemSku, String item, int quantity, BigDecimal amount) {
+        if (quantity < 1) {
+            throw new IllegalArgumentException("quantity must be at least 1, was " + quantity);
+        }
+        return new Order(UUID.randomUUID(), userId, itemSku, item, quantity, amount, OrderStatus.PENDING);
     }
 
     /**
@@ -85,8 +103,16 @@ public class Order {
         return userId;
     }
 
+    public String getItemSku() {
+        return itemSku;
+    }
+
     public String getItem() {
         return item;
+    }
+
+    public int getQuantity() {
+        return quantity;
     }
 
     public BigDecimal getAmount() {

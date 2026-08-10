@@ -61,6 +61,33 @@ This is a **portfolio / learning project**. It exists to demonstrate, in working
 | **saga-orchestrator** | The brain. Owns the `Saga` record and its state machine (`STARTED` → `CONFIRMED` / `COMPENSATING` → `CANCELLED`). Consumes `OrderCreated` and every service reply, and is the **only** component that decides which command is issued next. Also owns each saga's timeout deadline, and exposes a query API used by `scheduler-service`. |
 | **scheduler-service** | Liveness watchdog. Periodically asks `saga-orchestrator` for sagas past their deadline that are still in a non-terminal state, takes a Redis lock keyed by saga id, and triggers the same compensation path an explicit failure would (§4). Holds no saga state of its own. |
 
+### 2.1 Order schema
+
+The `Order` aggregate, owned by order-service:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `id` | `UUID` | Primary key. Also the partition key for `OrderCreated`, which precedes saga creation. |
+| `userId` | `String` | Client-supplied identifier. Not validated against any user service. |
+| `itemSku` | `String` | **Inventory item identifier**, in the same space as inventory-service's `itemId`. This is what gets reserved. |
+| `item` | `String` | Free-text description for display. **Never** used to look up stock. |
+| `quantity` | `int` | How many units to reserve. Minimum 1, enforced at both the API and the domain constructor. |
+| `amount` | `BigDecimal` | Money, `precision 19, scale 2`. What payment-service charges. |
+| `status` | `OrderStatus` | `PENDING` → `CONFIRMED` / `CANCELLED`. Only `PENDING` is non-terminal. |
+| `createdAt` / `updatedAt` | `Instant` | Hibernate-managed. |
+
+> **`itemSku` and `quantity` were a gap found while building inventory-service (Chunk 2).**
+> The original schema had only the free-text `item` and a money `amount`, which meant
+> `ReserveInventory` had no item identifier to reserve against and no quantity to reserve
+> — the orchestrator would have had nothing to populate the command with. The fix is
+> additive: `item` is kept as display text, and the two new fields carry the values the
+> saga actually needs.
+>
+> `itemSku` has no enforced format. Matching inventory-service's `itemId` is a convention,
+> not a constraint — a reservation for an unknown SKU fails at inventory-service with
+> `UNKNOWN_ITEM` rather than being rejected at order creation, because order-service does
+> not query inventory (that would be the synchronous inter-service call §1 rules out).
+
 ---
 
 ## 3. Saga flow
@@ -70,12 +97,15 @@ decision-maker at every branch.
 
 ### 3.1 Happy path
 
-1. Client `POST`s to **order-service** to create an order. The order is persisted with
+1. Client `POST`s to **order-service** to create an order, supplying `itemSku` and
+   `quantity` alongside the description and amount (§2.1). The order is persisted with
    status **`PENDING`**.
-2. **order-service** publishes **`OrderCreated`**.
+2. **order-service** publishes **`OrderCreated`**, carrying `itemSku`, `quantity` and
+   `amount` — the values the rest of the saga acts on.
 3. **saga-orchestrator** consumes `OrderCreated`, creates a saga record with status
    **`STARTED`** and a **timeout deadline**, then publishes the **`ReserveInventory`**
-   command.
+   command, forwarding `itemSku` and `quantity` straight from the event. The orchestrator
+   invents nothing here: everything it needs to reserve stock arrives with the order.
 4. **inventory-service** consumes `ReserveInventory`, attempts the reservation, and
    publishes **`InventoryReserved`** on success.
 5. **saga-orchestrator** consumes `InventoryReserved` and publishes the
