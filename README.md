@@ -29,6 +29,30 @@ the non-goals in [ARCHITECTURE.md](ARCHITECTURE.md).
 | `saga-orchestrator` | Saga state machine — the only component deciding the next step |
 | `scheduler-service` | Timeout sweep + Redis lock, triggers compensation |
 
+## Triggering a payment failure on purpose
+
+Payment is simulated and **deterministic**, so the compensation path can be demonstrated
+reliably rather than waited for. A payment fails when its amount is **strictly greater
+than** `payment.simulation.failure-threshold` (default `1000.00`); anything at or below
+succeeds.
+
+To force the failure path, place an order whose **total** exceeds the threshold — note it
+is the total that is charged, not the unit price:
+
+```bash
+curl -X POST http://localhost:8081/orders -H 'Content-Type: application/json' -d '{"userId":"user-1","itemSku":"MECH-KB-01","item":"Mechanical keyboard","quantity":2,"unitPrice":600.00}'
+```
+
+That is `600.00 x 2 = 1200.00`, above the threshold, so payment-service publishes
+`PaymentFailed` and the saga compensates. To make *every* payment fail instead:
+
+```bash
+export PAYMENT_FAILURE_THRESHOLD=0
+```
+
+A random gateway was deliberately avoided — it would make the compensation tests flaky,
+and compensation is the part of a saga worth testing.
+
 ## Architecture
 
 [ARCHITECTURE.md](ARCHITECTURE.md) is the design reference: saga flow step by step, both

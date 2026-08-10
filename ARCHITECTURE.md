@@ -175,6 +175,33 @@ back.
 > distinction is what makes the state machine worth having, and it is exactly what §8
 > tests hardest.
 
+### 3.5 Compensating a saga where payment already succeeded
+
+Path B needs no refund: the payment *failed*, so no money moved and releasing the stock
+is the whole of the undo.
+
+There is a third situation, and it is the one that makes `RefundPayment` necessary. A
+payment can succeed and its `PaymentCompleted` reply then be lost — the broker drops it,
+or the orchestrator dies before handling it. The saga sits in `STARTED` past its deadline,
+the §4 sweep picks it up, and compensation runs against a saga that **did** take the
+customer's money.
+
+Compensating such a saga requires undoing *both* side effects:
+
+- **`ReleaseInventory`** — hand the stock back, and
+- **`RefundPayment`** — hand the money back.
+
+`RefundPayment` is therefore addressed to payment-service in exactly the same way
+`ReleaseInventory` is addressed to inventory-service, and is idempotent for the same
+reason: it is reachable from a timeout, so it can genuinely arrive twice, and it can
+arrive for a saga that never paid at all (a no-op, not an error).
+
+> **Added in Chunk 3.** The original §3 described only the two failure paths above and
+> had no refund anywhere, which left the timeout-after-payment case with no way to return
+> the money. The orchestrator work in Chunk 5 has to issue `RefundPayment` whenever it
+> compensates a saga that reached the paid state — that branch does not exist in §3.4's
+> diagram yet and needs adding when the state machine is built.
+
 ### 3.4 State machine
 
 ```mermaid
@@ -263,6 +290,7 @@ of being an emergent property of who happens to subscribe to what.
 | `inventory.commands.reserve-inventory.v1` | inventory-service |
 | `inventory.commands.release-inventory.v1` | inventory-service (compensation) |
 | `payment.commands.process-payment.v1` | payment-service |
+| `payment.commands.refund-payment.v1` | payment-service (compensation) |
 | `order.commands.confirm-order.v1` | order-service |
 | `order.commands.cancel-order.v1` | order-service |
 
@@ -320,8 +348,9 @@ local transaction** as the business change, so the dedup record and the effect c
 atomically or not at all — a marker able to commit without its effect would permanently
 suppress a command that never took place.
 
-**Implemented in `inventory-service` as of Chunk 2.** A duplicate there is a logged no-op
-that does **not** re-publish the original result. If the original reply was genuinely
+**Implemented in `inventory-service` (Chunk 2) and `payment-service` (Chunk 3),** with the
+same table name and the same message-id primary key. A duplicate is a logged no-op that
+does **not** re-publish the original result. If the original reply was genuinely
 lost, the saga stalls and the §4 timeout sweep is what recovers it; re-publishing from a
 stored outcome is a possible refinement, deliberately not built, because it would
 duplicate recovery logic the scheduler already owns.
@@ -495,9 +524,17 @@ Update after every chunk.
       have never executed — Docker is unreachable from the dev machine (see README). Only
       the unit tests are proven green, and they stub the dedup lookup, so the
       database-enforced half of the idempotency guarantee is unverified.
-- [ ] **Chunk 3 — payment-service.** Payment record, simulated outcomes, consumes
-      `ProcessPayment`, publishes `PaymentCompleted` / `PaymentFailed`. *Branch:
-      `feature/payment-service`.*
+- [x] **Chunk 3 — payment-service.** Payment record, simulated outcomes, consumes
+      `ProcessPayment`, publishes `PaymentCompleted` / `PaymentFailed`; consumes
+      `RefundPayment` as the compensating action (new — see §3.5); **plus its own
+      `processed_commands` dedup** (pulled forward from Chunk 6, as inventory-service's
+      was). *Branch: `feature/payment-service`.*
+      **Failure trigger:** payments strictly above `payment.simulation.failure-threshold`
+      (default `1000.00`) fail deterministically. Order a total above it — e.g.
+      `unitPrice 600.00 x quantity 2` — or set the threshold to `0` to fail everything.
+      **Caveat:** as with Chunks 1 and 2, the Testcontainers integration tests are written
+      but have never executed — Docker is unreachable from the dev machine (see README).
+      Only the unit tests are proven green.
 - [ ] **Chunk 4 — notification-service.** Consumes terminal-state events, stubbed
       notification delivery. *Branch: `feature/notification-service`.*
 - [ ] **Chunk 5 — saga-orchestrator.** `Saga` entity, timeout deadline, and the complete
@@ -505,11 +542,11 @@ Update after every chunk.
       `ProcessPayment` on success, compensation on payment failure, and the
       `STARTED` / `CONFIRMED` / `COMPENSATING` / `CANCELLED` transitions of §3.
       *Branch: `feature/saga-orchestrator`.*
-- [ ] **Chunk 6 — idempotency (remaining services).** Dedup in payment-service and the
-      orchestrator (§6). inventory-service's landed early, in Chunk 2. Still ahead of
-      scheduler-service because §4 compensation is reachable from both an explicit failure
-      and a timeout, so the scheduler's correctness depends on these handlers already
-      being idempotent.
+- [ ] **Chunk 6 — idempotency (orchestrator only).** Dedup on the orchestrator's reply
+      side (§6): a duplicated `PaymentCompleted` must not drive a second `OrderConfirmed`.
+      inventory-service's landed in Chunk 2 and payment-service's in Chunk 3, so this is
+      all that remains. Still ahead of scheduler-service because §4 compensation is
+      reachable from both an explicit failure and a timeout.
 - [ ] **Chunk 7 — scheduler-service.** Timeout sweep, orchestrator query API, Redis
       distributed lock, compensation trigger (§4). *Branch: `feature/scheduler-service`.*
 - [ ] **Chunk 8 — integration test suite.** Testcontainers harness plus all seven
