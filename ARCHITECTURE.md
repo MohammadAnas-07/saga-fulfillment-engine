@@ -396,10 +396,17 @@ state is modelled explicitly rather than collapsed into `CANCELLED`.
 
 ## 10. Chunk checklist
 
-> **Derived section — needs confirmation.** The prompt said the chunks were "listed
-> below" but none were included. This list is reconstructed from the architecture above
-> and ordered by dependency. Replace it with the intended plan if it differs; §10 is
-> meant to be the single source of truth, so it should not stay a guess.
+> **Service ordering is authoritative.** The Chunk 0 draft of this list was derived from
+> the architecture rather than supplied, and put `saga-orchestrator` before
+> `inventory-service` and `payment-service`. The intended sequence is the reverse: build
+> every executor service first, then the orchestrator that drives them, then the
+> scheduler.
+>
+> **order-service → inventory-service → payment-service → notification-service →
+> saga-orchestrator → scheduler-service.**
+>
+> Non-service chunks (idempotency, integration suite, docs) are interleaved where they
+> make sense and do not change that sequence.
 
 Update after every chunk.
 
@@ -413,22 +420,27 @@ Update after every chunk.
       **Caveat:** the Testcontainers integration tests are written but have never
       executed — Docker is unreachable from the dev machine (see README). Only the unit
       tests are proven green.
-- [ ] **Chunk 2 — saga-orchestrator core.** `Saga` entity, state machine, consumes
-      `OrderCreated`, creates saga with deadline, publishes `ReserveInventory`.
-- [ ] **Chunk 3 — inventory-service.** Stock model, reserve and release handlers,
-      publishes reserved/failed/released events.
-- [ ] **Chunk 4 — payment-service.** Payment record, simulated outcomes, publishes
-      completed/failed events.
-- [ ] **Chunk 5 — orchestrator completion.** Full branch handling: `ProcessPayment` on
-      reserve success, compensation on payment failure, `CONFIRMED` / `COMPENSATING` /
-      `CANCELLED` transitions.
-- [ ] **Chunk 6 — notification-service.** Consumes terminal-state events, stubbed
-      notification delivery.
-- [ ] **Chunk 7 — idempotency.** `processed_message` dedup in inventory-service,
-      payment-service, and orchestrator (§6).
-- [ ] **Chunk 8 — scheduler-service.** Timeout sweep, orchestrator query API, Redis
-      distributed lock, compensation trigger (§4).
-- [ ] **Chunk 9 — integration test suite.** Testcontainers harness plus all seven
+- [ ] **Chunk 2 — inventory-service.** Stock model, `ReserveInventory` and
+      `ReleaseInventory` handlers, publishes `InventoryReserved` /
+      `InventoryReservationFailed` / `InventoryReleased`. *Branch:
+      `feature/inventory-service`.*
+- [ ] **Chunk 3 — payment-service.** Payment record, simulated outcomes, consumes
+      `ProcessPayment`, publishes `PaymentCompleted` / `PaymentFailed`. *Branch:
+      `feature/payment-service`.*
+- [ ] **Chunk 4 — notification-service.** Consumes terminal-state events, stubbed
+      notification delivery. *Branch: `feature/notification-service`.*
+- [ ] **Chunk 5 — saga-orchestrator.** `Saga` entity, timeout deadline, and the complete
+      state machine in one pass: consumes `OrderCreated`, issues `ReserveInventory`, then
+      `ProcessPayment` on success, compensation on payment failure, and the
+      `STARTED` / `CONFIRMED` / `COMPENSATING` / `CANCELLED` transitions of §3.
+      *Branch: `feature/saga-orchestrator`.*
+- [ ] **Chunk 6 — idempotency.** `processed_message` dedup in inventory-service,
+      payment-service, and the orchestrator (§6). Lands before scheduler-service because
+      §4 compensation is reachable from both an explicit failure and a timeout, so the
+      scheduler's correctness depends on these handlers already being idempotent.
+- [ ] **Chunk 7 — scheduler-service.** Timeout sweep, orchestrator query API, Redis
+      distributed lock, compensation trigger (§4). *Branch: `feature/scheduler-service`.*
+- [ ] **Chunk 8 — integration test suite.** Testcontainers harness plus all seven
       failure/compensation cases in §8.3.
-- [ ] **Chunk 10 — local run and docs.** `docker-compose` for Kafka/Postgres/Redis,
+- [ ] **Chunk 9 — local run and docs.** `docker-compose` for Kafka/Postgres/Redis,
       README run instructions, observability pass.
