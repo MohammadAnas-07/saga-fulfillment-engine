@@ -7,6 +7,7 @@ import jakarta.persistence.Enumerated;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.Instant;
 import java.util.UUID;
 import org.hibernate.annotations.CreationTimestamp;
@@ -42,6 +43,17 @@ public class Order {
     @Column(nullable = false, updatable = false)
     private int quantity;
 
+    /** Price of one unit, normalised to 2 decimal places. Always greater than zero. */
+    @Column(name = "unit_price", nullable = false, updatable = false, precision = 19, scale = 2)
+    private BigDecimal unitPrice;
+
+    /**
+     * The order total, and strictly {@code unitPrice * quantity}.
+     *
+     * <p>Derived in the constructor and never accepted from a caller, so it cannot drift
+     * from the arithmetic it claims to represent. This is the figure payment-service
+     * charges.
+     */
     @Column(nullable = false, updatable = false, precision = 19, scale = 2)
     private BigDecimal amount;
 
@@ -62,22 +74,45 @@ public class Order {
     }
 
     private Order(UUID id, String userId, String itemSku, String item, int quantity,
-            BigDecimal amount, OrderStatus status) {
+            BigDecimal unitPrice, OrderStatus status) {
         this.id = id;
         this.userId = userId;
         this.itemSku = itemSku;
         this.item = item;
         this.quantity = quantity;
-        this.amount = amount;
+        this.unitPrice = unitPrice;
+        this.amount = unitPrice.multiply(BigDecimal.valueOf(quantity));
         this.status = status;
     }
 
-    /** Creates a new order in {@link OrderStatus#PENDING}, the only valid entry state. */
-    public static Order create(String userId, String itemSku, String item, int quantity, BigDecimal amount) {
+    /**
+     * Creates a new order in {@link OrderStatus#PENDING}, the only valid entry state.
+     *
+     * <p>The total is <em>computed</em> here rather than supplied, which is the whole
+     * point: there is no code path that can persist an amount inconsistent with
+     * {@code unitPrice * quantity}.
+     *
+     * <p>{@code unitPrice} is normalised to 2 decimal places before the multiplication,
+     * so the product is exact at money scale and the stored total equals the stored unit
+     * price times the stored quantity with no rounding left over. A price that rounds
+     * away to zero at that scale is rejected rather than silently made free.
+     */
+    public static Order create(String userId, String itemSku, String item, int quantity, BigDecimal unitPrice) {
         if (quantity < 1) {
             throw new IllegalArgumentException("quantity must be at least 1, was " + quantity);
         }
-        return new Order(UUID.randomUUID(), userId, itemSku, item, quantity, amount, OrderStatus.PENDING);
+        if (unitPrice == null || unitPrice.signum() <= 0) {
+            throw new IllegalArgumentException("unitPrice must be greater than zero, was " + unitPrice);
+        }
+
+        BigDecimal normalisedUnitPrice = unitPrice.setScale(2, RoundingMode.HALF_UP);
+        if (normalisedUnitPrice.signum() <= 0) {
+            throw new IllegalArgumentException(
+                    "unitPrice rounds to zero at 2 decimal places, was " + unitPrice);
+        }
+
+        return new Order(UUID.randomUUID(), userId, itemSku, item, quantity,
+                normalisedUnitPrice, OrderStatus.PENDING);
     }
 
     /**
@@ -113,6 +148,10 @@ public class Order {
 
     public int getQuantity() {
         return quantity;
+    }
+
+    public BigDecimal getUnitPrice() {
+        return unitPrice;
     }
 
     public BigDecimal getAmount() {

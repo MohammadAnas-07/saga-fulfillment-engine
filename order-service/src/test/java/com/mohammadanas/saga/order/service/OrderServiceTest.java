@@ -37,7 +37,9 @@ class OrderServiceTest {
     private static final String ITEM_SKU = "MECH-KB-01";
     private static final String ITEM = "Mechanical keyboard";
     private static final int QUANTITY = 2;
-    private static final BigDecimal AMOUNT = new BigDecimal("49.99");
+    private static final BigDecimal UNIT_PRICE = new BigDecimal("49.99");
+    /** Always UNIT_PRICE * QUANTITY — restated here so the test asserts the arithmetic, not the code's opinion of it. */
+    private static final BigDecimal EXPECTED_TOTAL = new BigDecimal("99.98");
 
     @Mock
     private OrderRepository orderRepository;
@@ -49,7 +51,7 @@ class OrderServiceTest {
     private OrderService orderService;
 
     private static Order orderIn(OrderStatus status) {
-        Order order = Order.create(USER_ID, ITEM_SKU, ITEM, QUANTITY, AMOUNT);
+        Order order = Order.create(USER_ID, ITEM_SKU, ITEM, QUANTITY, UNIT_PRICE);
         if (status != OrderStatus.PENDING) {
             order.transitionTo(status);
         }
@@ -65,22 +67,22 @@ class OrderServiceTest {
         void persistsAsPending() {
             when(orderRepository.save(any(Order.class))).thenAnswer(inv -> inv.getArgument(0));
 
-            Order created = orderService.createOrder(USER_ID, ITEM_SKU, ITEM, QUANTITY, AMOUNT);
+            Order created = orderService.createOrder(USER_ID, ITEM_SKU, ITEM, QUANTITY, UNIT_PRICE);
 
             assertThat(created.getStatus()).isEqualTo(OrderStatus.PENDING);
             assertThat(created.getUserId()).isEqualTo(USER_ID);
             assertThat(created.getItemSku()).isEqualTo(ITEM_SKU);
             assertThat(created.getItem()).isEqualTo(ITEM);
             assertThat(created.getQuantity()).isEqualTo(QUANTITY);
-            assertThat(created.getAmount()).isEqualByComparingTo(AMOUNT);
+            assertThat(created.getUnitPrice()).isEqualByComparingTo(UNIT_PRICE);
         }
 
         @Test
-        @DisplayName("publishes OrderCreated carrying orderId, userId, itemSku, item, quantity and amount")
+        @DisplayName("publishes OrderCreated carrying orderId, userId, itemSku, item, quantity, unitPrice and amount")
         void publishesOrderCreatedWithCorrectPayload() {
             when(orderRepository.save(any(Order.class))).thenAnswer(inv -> inv.getArgument(0));
 
-            Order created = orderService.createOrder(USER_ID, ITEM_SKU, ITEM, QUANTITY, AMOUNT);
+            Order created = orderService.createOrder(USER_ID, ITEM_SKU, ITEM, QUANTITY, UNIT_PRICE);
 
             ArgumentCaptor<OrderCreatedEvent> captor = ArgumentCaptor.forClass(OrderCreatedEvent.class);
             verify(eventPublisher).publishOrderCreated(captor.capture());
@@ -89,23 +91,85 @@ class OrderServiceTest {
             assertThat(event.orderId()).isEqualTo(created.getId());
             assertThat(event.userId()).isEqualTo(USER_ID);
             assertThat(event.item()).isEqualTo(ITEM);
-            assertThat(event.amount()).isEqualByComparingTo(AMOUNT);
             assertThat(event.messageId()).isNotNull();
             assertThat(event.occurredAt()).isNotNull();
-
-            // The fields this change exists for: without these the orchestrator has
-            // nothing to put in ReserveInventory.
             assertThat(event.itemSku()).isEqualTo(ITEM_SKU);
             assertThat(event.quantity()).isEqualTo(QUANTITY);
+
+            // The event must carry the derived total, not the unit price, since
+            // ProcessPayment charges `amount`.
+            assertThat(event.unitPrice()).isEqualByComparingTo(UNIT_PRICE);
+            assertThat(event.amount()).isEqualByComparingTo(EXPECTED_TOTAL);
         }
 
         @Test
         @DisplayName("rejects a quantity below 1 at the domain boundary, not just at the API")
         void rejectsNonPositiveQuantity() {
             org.assertj.core.api.Assertions
-                    .assertThatThrownBy(() -> orderService.createOrder(USER_ID, ITEM_SKU, ITEM, 0, AMOUNT))
+                    .assertThatThrownBy(() -> orderService.createOrder(USER_ID, ITEM_SKU, ITEM, 0, UNIT_PRICE))
                     .isInstanceOf(IllegalArgumentException.class)
                     .hasMessageContaining("quantity must be at least 1");
+        }
+    }
+
+    @Nested
+    @DisplayName("amount is derived, never supplied")
+    class TotalIsDerived {
+
+        @Test
+        @DisplayName("amount equals unitPrice * quantity")
+        void computesTotal() {
+            Order order = Order.create(USER_ID, ITEM_SKU, ITEM, QUANTITY, UNIT_PRICE);
+
+            assertThat(order.getAmount()).isEqualByComparingTo(EXPECTED_TOTAL);
+            assertThat(order.getAmount())
+                    .isEqualByComparingTo(UNIT_PRICE.multiply(BigDecimal.valueOf(QUANTITY)));
+        }
+
+        @Test
+        @DisplayName("a quantity of 1 makes the total equal the unit price")
+        void singleUnitTotalEqualsUnitPrice() {
+            Order order = Order.create(USER_ID, ITEM_SKU, ITEM, 1, new BigDecimal("15.00"));
+
+            assertThat(order.getAmount()).isEqualByComparingTo(new BigDecimal("15.00"));
+        }
+
+        @Test
+        @DisplayName("the total stays exact at money scale for a large quantity")
+        void largeQuantityStaysExact() {
+            Order order = Order.create(USER_ID, ITEM_SKU, ITEM, 1000, new BigDecimal("0.07"));
+
+            assertThat(order.getAmount()).isEqualByComparingTo(new BigDecimal("70.00"));
+        }
+
+        @Test
+        @DisplayName("a sub-cent unit price is normalised to 2dp before multiplying")
+        void normalisesUnitPriceToMoneyScale() {
+            Order order = Order.create(USER_ID, ITEM_SKU, ITEM, 3, new BigDecimal("1.005"));
+
+            // 1.005 rounds HALF_UP to 1.01, so the total is 3.03 and not 3.015 —
+            // the stored total always equals the stored unit price times quantity.
+            assertThat(order.getUnitPrice()).isEqualByComparingTo(new BigDecimal("1.01"));
+            assertThat(order.getAmount()).isEqualByComparingTo(new BigDecimal("3.03"));
+        }
+
+        @Test
+        @DisplayName("rejects a non-positive unit price")
+        void rejectsNonPositiveUnitPrice() {
+            org.assertj.core.api.Assertions
+                    .assertThatThrownBy(() -> Order.create(USER_ID, ITEM_SKU, ITEM, 1, BigDecimal.ZERO))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("unitPrice must be greater than zero");
+        }
+
+        @Test
+        @DisplayName("rejects a unit price that rounds away to zero rather than making it free")
+        void rejectsUnitPriceRoundingToZero() {
+            org.assertj.core.api.Assertions
+                    .assertThatThrownBy(
+                            () -> Order.create(USER_ID, ITEM_SKU, ITEM, 1, new BigDecimal("0.001")))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("rounds to zero");
         }
     }
 

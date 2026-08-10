@@ -6,12 +6,17 @@ import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.UUID;
 
+/**
+ * @param amount the order total. Always {@code unitPrice * quantity} — returned for
+ *               convenience, never independently settable.
+ */
 public record OrderResponse(
         UUID id,
         String userId,
         String itemSku,
         String item,
         int quantity,
+        BigDecimal unitPrice,
         BigDecimal amount,
         OrderStatus status,
         Instant createdAt,
@@ -24,6 +29,7 @@ public record OrderResponse(
                 order.getItemSku(),
                 order.getItem(),
                 order.getQuantity(),
+                order.getUnitPrice(),
                 order.getAmount(),
                 order.getStatus(),
                 order.getCreatedAt(),
