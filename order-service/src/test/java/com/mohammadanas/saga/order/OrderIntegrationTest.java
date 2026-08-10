@@ -153,17 +153,23 @@ class OrderIntegrationTest {
         assertThat(persisted.getQuantity()).isEqualTo(2);
         assertThat(persisted.getCreatedAt()).isNotNull();
 
+        // The total is derived, and survives the round-trip through Postgres at
+        // money scale: 49.99 x 2.
+        assertThat(persisted.getUnitPrice()).isEqualByComparingTo(new BigDecimal("49.99"));
+        assertThat(persisted.getAmount()).isEqualByComparingTo(new BigDecimal("99.98"));
+
         OrderCreatedEvent event = awaitOrderCreated(body.id());
         assertThat(event.userId()).isEqualTo("user-42");
         assertThat(event.item()).isEqualTo("Mechanical keyboard");
-        assertThat(event.amount()).isEqualByComparingTo(new BigDecimal("49.99"));
         assertThat(event.messageId()).isNotNull();
         assertThat(event.itemSku()).isEqualTo("MECH-KB-01");
         assertThat(event.quantity()).isEqualTo(2);
+        assertThat(event.unitPrice()).isEqualByComparingTo(new BigDecimal("49.99"));
+        assertThat(event.amount()).isEqualByComparingTo(new BigDecimal("99.98"));
     }
 
     @Test
-    @DisplayName("POST /orders rejects a missing itemSku or a quantity below 1")
+    @DisplayName("POST /orders rejects a missing itemSku, a quantity below 1, or a non-positive unitPrice")
     void rejectsInvalidRequests() {
         ResponseEntity<String> missingSku = restTemplate.postForEntity("/orders",
                 new CreateOrderRequest("user-9", "  ", "Desk mat", 1, new BigDecimal("19.00")), String.class);
@@ -172,6 +178,10 @@ class OrderIntegrationTest {
         ResponseEntity<String> zeroQuantity = restTemplate.postForEntity("/orders",
                 new CreateOrderRequest("user-9", "DESK-MAT-01", "Desk mat", 0, new BigDecimal("19.00")), String.class);
         assertThat(zeroQuantity.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+
+        ResponseEntity<String> zeroPrice = restTemplate.postForEntity("/orders",
+                new CreateOrderRequest("user-9", "DESK-MAT-01", "Desk mat", 1, BigDecimal.ZERO), String.class);
+        assertThat(zeroPrice.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
     }
 
     @Test

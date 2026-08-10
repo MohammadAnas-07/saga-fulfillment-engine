@@ -12,8 +12,10 @@ import java.util.UUID;
  * messages are keyed by {@code orderId} instead (ARCHITECTURE.md section 5.4).
  *
  * <p>{@code itemSku} and {@code quantity} are what the orchestrator forwards into
- * {@code ReserveInventory}. Without them the saga has nothing to reserve — see the note
- * in ARCHITECTURE.md section 2.1.
+ * {@code ReserveInventory}; {@code amount} is what it forwards into {@code ProcessPayment}.
+ * {@code unitPrice} rides along so a consumer can audit the total rather than having to
+ * take it on trust — {@code amount} is always {@code unitPrice * quantity}
+ * (ARCHITECTURE.md section 2.1).
  */
 public record OrderCreatedEvent(
         UUID messageId,
@@ -22,12 +24,19 @@ public record OrderCreatedEvent(
         String itemSku,
         String item,
         int quantity,
+        BigDecimal unitPrice,
         BigDecimal amount,
         Instant occurredAt) {
 
     public static OrderCreatedEvent from(
-            UUID orderId, String userId, String itemSku, String item, int quantity, BigDecimal amount) {
+            UUID orderId,
+            String userId,
+            String itemSku,
+            String item,
+            int quantity,
+            BigDecimal unitPrice,
+            BigDecimal amount) {
         return new OrderCreatedEvent(
-                UUID.randomUUID(), orderId, userId, itemSku, item, quantity, amount, Instant.now());
+                UUID.randomUUID(), orderId, userId, itemSku, item, quantity, unitPrice, amount, Instant.now());
     }
 }

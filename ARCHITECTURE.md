@@ -72,7 +72,8 @@ The `Order` aggregate, owned by order-service:
 | `itemSku` | `String` | **Inventory item identifier**, in the same space as inventory-service's `itemId`. This is what gets reserved. |
 | `item` | `String` | Free-text description for display. **Never** used to look up stock. |
 | `quantity` | `int` | How many units to reserve. Minimum 1, enforced at both the API and the domain constructor. |
-| `amount` | `BigDecimal` | Money, `precision 19, scale 2`. What payment-service charges. |
+| `unitPrice` | `BigDecimal` | Price of **one** unit, `precision 19, scale 2`. Must be greater than zero. Client-supplied. |
+| `amount` | `BigDecimal` | The order **total**, `precision 19, scale 2`. **Derived**, never supplied — see below. What payment-service charges. |
 | `status` | `OrderStatus` | `PENDING` → `CONFIRMED` / `CANCELLED`. Only `PENDING` is non-terminal. |
 | `createdAt` / `updatedAt` | `Instant` | Hibernate-managed. |
 
@@ -87,6 +88,30 @@ The `Order` aggregate, owned by order-service:
 > not a constraint — a reservation for an unknown SKU fails at inventory-service with
 > `UNKNOWN_ITEM` rather than being rejected at order creation, because order-service does
 > not query inventory (that would be the synchronous inter-service call §1 rules out).
+
+#### The total is derived
+
+```
+amount = unitPrice × quantity
+```
+
+`amount` is computed in `Order`'s constructor and is **not a parameter** of
+`Order.create(...)` or of the REST request. There is deliberately no code path — no
+setter, no builder, no test helper — that can persist a total inconsistent with the unit
+price and quantity it sits beside. An order whose `amount` disagrees with its own
+arithmetic is not a state the type can represent.
+
+This resolves an ambiguity that stood until `unitPrice` was added: `amount` alongside a
+`quantity` could plausibly have meant either the per-unit price or the line total, and
+payment-service is about to charge it. It is the total.
+
+`unitPrice` is normalised to 2 decimal places (`HALF_UP`) **before** the multiplication,
+so the stored total is exactly the stored unit price times the stored quantity with no
+rounding residue — `1.005 × 3` is stored as `1.01` and `3.03`, not `3.015`. A price that
+rounds away to zero at that scale is rejected rather than silently made free.
+
+`OrderCreatedEvent` carries `unitPrice` as well as `amount`, so a downstream consumer can
+re-derive and audit the total instead of trusting it.
 
 ---
 

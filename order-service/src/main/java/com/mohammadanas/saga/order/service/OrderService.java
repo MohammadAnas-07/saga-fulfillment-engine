@@ -35,8 +35,8 @@ public class OrderService {
 
     /** Creates a PENDING order and announces it, which starts the saga. */
     @Transactional
-    public Order createOrder(String userId, String itemSku, String item, int quantity, BigDecimal amount) {
-        Order order = orderRepository.save(Order.create(userId, itemSku, item, quantity, amount));
+    public Order createOrder(String userId, String itemSku, String item, int quantity, BigDecimal unitPrice) {
+        Order order = orderRepository.save(Order.create(userId, itemSku, item, quantity, unitPrice));
 
         eventPublisher.publishOrderCreated(OrderCreatedEvent.from(
                 order.getId(),
@@ -44,10 +44,11 @@ public class OrderService {
                 order.getItemSku(),
                 order.getItem(),
                 order.getQuantity(),
+                order.getUnitPrice(),
                 order.getAmount()));
 
-        log.info("Created order {} for user {}: {} x{} amount {}",
-                order.getId(), userId, itemSku, quantity, amount);
+        log.info("Created order {} for user {}: {} x{} at {} each, total {}",
+                order.getId(), userId, itemSku, quantity, order.getUnitPrice(), order.getAmount());
         return order;
     }
 
