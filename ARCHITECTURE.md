@@ -38,6 +38,13 @@ This is a **portfolio / learning project**. It exists to demonstrate, in working
   gateway. `payment-service` simulates outcomes (success/failure/delay) so the
   compensation paths can be exercised deterministically. Nothing here is PCI-compliant
   and none of it should be pointed at real money.
+- **No real notification delivery.** `notification-service` renders a customer message and
+  writes it to the log. There is no email, SMS, or push integration, and no notification
+  history — the `NotificationSender` interface is where a real channel would attach.
+- **No service discovery.** There is no Eureka, Consul, or Spring Cloud dependency
+  anywhere in the project, and none is planned. Services find Kafka and their own database
+  through configuration; they never call each other directly (§1), so there is nothing for
+  a registry to resolve.
 - **No real authentication, authorization, or multi-tenancy.**
 - **No production hardening** — no rate limiting, no autoscaling, no SLA, no DR plan.
 - **Not a Kafka Streams / event-sourcing showcase.** Saga state is kept in a relational
@@ -138,9 +145,17 @@ decision-maker at every branch.
 6. **payment-service** consumes `ProcessPayment` and publishes **`PaymentCompleted`** on
    success.
 7. **saga-orchestrator** consumes `PaymentCompleted`, marks the saga **`CONFIRMED`**, and
-   publishes **`OrderConfirmed`**.
-8. **order-service** marks the order **`CONFIRMED`**; **notification-service** notifies
-   the customer. Saga is terminal.
+   publishes the **`ConfirmOrder`** command.
+8. **order-service** marks the order **`CONFIRMED`** and publishes the
+   **`OrderConfirmed`** event; **notification-service** consumes it and notifies the
+   customer. Saga is terminal.
+
+> **Corrected in Chunk 4.** Step 7 previously said the *orchestrator* publishes
+> `OrderConfirmed`, which contradicted §5.3's listing of both terminal-state topics as
+> order-service-produced. The listing is right and the step was loose: an order reaching
+> `CONFIRMED` is a fact about the order aggregate, and §5.1 has events published by the
+> service that owns the data. The orchestrator issues the *command*; order-service
+> announces the *fact*. The same correction applies to the cancellation paths below.
 
 ### 3.2 Failure path A — inventory reservation fails
 
@@ -318,8 +333,20 @@ of being an emergent property of who happens to subscribe to what.
 | `payment.events.payment-completed.v1` | payment-service |
 | `payment.events.payment-failed.v1` | payment-service |
 | `payment.events.payment-refunded.v1` | payment-service (compensation confirmation) |
-| `order.events.order-confirmed.v1` | order-service |
-| `order.events.order-cancelled.v1` | order-service |
+| `order.events.order-confirmed.v1` | order-service — **no producer yet**, see below |
+| `order.events.order-cancelled.v1` | order-service — **no producer yet**, see below |
+
+> **The two terminal-state order topics have no producer as of Chunk 4.** order-service
+> publishes only `OrderCreated`; it consumes `ConfirmOrder` / `CancelOrder` and applies the
+> status change silently. `notification-service` is therefore a complete consumer with
+> nothing yet feeding it, and its `OrderConfirmedEvent` / `OrderCancelledEvent` records are
+> a contract **authored** by Chunk 4 rather than one confirmed against a producer.
+>
+> Closing this needs order-service to publish both events when it applies a terminal
+> status. Until then the end-to-end path stops at the order status change, and
+> notification-service is exercised only by tests that publish the events directly — the
+> same way inventory-service and payment-service were built before the orchestrator that
+> commands them existed.
 
 ### 5.3.1 Compensation confirmations are unconditional
 
@@ -390,8 +417,9 @@ local transaction** as the business change, so the dedup record and the effect c
 atomically or not at all — a marker able to commit without its effect would permanently
 suppress a command that never took place.
 
-**Implemented in `inventory-service` (Chunk 2) and `payment-service` (Chunk 3),** with the
-same table name and the same message-id primary key. A duplicate is a logged no-op that
+**Implemented in `inventory-service` (Chunk 2), `payment-service` (Chunk 3), and
+`notification-service` (Chunk 4** — as `processed_messages`, since it consumes events
+rather than commands**),** all with the same message-id primary key. A duplicate is a logged no-op that
 does **not** re-publish the original result. If the original reply was genuinely
 lost, the saga stalls and the §4 timeout sweep is what recovers it; re-publishing from a
 stored outcome is a possible refinement, deliberately not built, because it would
@@ -577,8 +605,16 @@ Update after every chunk.
       **Caveat:** as with Chunks 1 and 2, the Testcontainers integration tests are written
       but have never executed — Docker is unreachable from the dev machine (see README).
       Only the unit tests are proven green.
-- [ ] **Chunk 4 — notification-service.** Consumes terminal-state events, stubbed
-      notification delivery. *Branch: `feature/notification-service`.*
+- [x] **Chunk 4 — notification-service.** Consumes `OrderConfirmed` / `OrderCancelled`,
+      renders a customer message and logs it via `NotificationSender`. No REST API, no
+      Eureka (none exists in this project — see §1 non-goals), **plus its own
+      `processed_messages` dedup**, which matters more here than anywhere else because a
+      sent notification cannot be un-sent. *Branch: `feature/notification-service`.*
+      **Blocked end to end:** neither topic has a producer yet (§5.3). order-service must
+      publish both when it applies a terminal status before this service does anything in
+      a running system. Its event records are a contract authored here, not confirmed.
+      **Caveat:** as with Chunks 1–3, the Testcontainers integration tests are written but
+      have never executed — Docker is unreachable from the dev machine (see README).
 - [ ] **Chunk 5 — saga-orchestrator.** `Saga` entity, timeout deadline, and the complete
       state machine in one pass: consumes `OrderCreated`, issues `ReserveInventory`, then
       `ProcessPayment` on success, compensation on payment failure, and the

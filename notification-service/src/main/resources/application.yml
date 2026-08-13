@@ -1,3 +1,33 @@
 spring:
   application:
     name: notification-service
+
+  # No web server: this service has no REST API, it is a pure Kafka consumer.
+  main:
+    web-application-type: none
+
+  datasource:
+    # notification-service owns its own database. It holds only the dedup table --
+    # there is no notification history, because nothing reads one back.
+    url: ${NOTIFICATION_DB_URL:jdbc:postgresql://localhost:5432/notification_db}
+    username: ${NOTIFICATION_DB_USER:notification_service}
+    password: ${NOTIFICATION_DB_PASSWORD:notification_service}
+
+  jpa:
+    hibernate:
+      # Fine for a portfolio project. A real deployment would use Flyway/Liquibase
+      # migrations and set this to `validate`.
+      ddl-auto: update
+    open-in-view: false
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    consumer:
+      group-id: ${NOTIFICATION_CONSUMER_GROUP:notification-service}
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+
+logging:
+  level:
+    com.mohammadanas.saga.notification: INFO
