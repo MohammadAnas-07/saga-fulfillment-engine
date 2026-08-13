@@ -34,6 +34,12 @@ public class PaymentEventPublisher {
                 event.reason(), event.orderId(), event.messageId());
     }
 
+    public void publishPaymentRefunded(PaymentRefundedEvent event) {
+        kafkaTemplate.send(PaymentTopics.PAYMENT_REFUNDED, key(event.sagaId()), event);
+        log.debug("Published PaymentRefunded({}) for order {} (messageId={})",
+                event.outcome(), event.orderId(), event.messageId());
+    }
+
     private static String key(UUID sagaId) {
         return sagaId == null ? null : sagaId.toString();
     }

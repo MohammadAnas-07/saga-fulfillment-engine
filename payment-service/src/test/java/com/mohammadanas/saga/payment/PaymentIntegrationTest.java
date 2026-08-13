@@ -8,9 +8,11 @@ import com.mohammadanas.saga.payment.domain.Payment;
 import com.mohammadanas.saga.payment.domain.PaymentRepository;
 import com.mohammadanas.saga.payment.domain.PaymentStatus;
 import com.mohammadanas.saga.payment.domain.ProcessedCommandRepository;
+import com.mohammadanas.saga.payment.messaging.CompensationOutcome;
 import com.mohammadanas.saga.payment.messaging.PaymentCompletedEvent;
 import com.mohammadanas.saga.payment.messaging.PaymentFailedEvent;
 import com.mohammadanas.saga.payment.messaging.PaymentFailureReason;
+import com.mohammadanas.saga.payment.messaging.PaymentRefundedEvent;
 import com.mohammadanas.saga.payment.messaging.PaymentTopics;
 import com.mohammadanas.saga.payment.messaging.ProcessPaymentCommand;
 import com.mohammadanas.saga.payment.messaging.RefundPaymentCommand;
@@ -120,7 +122,8 @@ class PaymentIntegrationTest {
             eventConsumer = new KafkaConsumer<>(props);
             eventConsumer.subscribe(List.of(
                     PaymentTopics.PAYMENT_COMPLETED,
-                    PaymentTopics.PAYMENT_FAILED));
+                    PaymentTopics.PAYMENT_FAILED,
+                    PaymentTopics.PAYMENT_REFUNDED));
         }
     }
 
@@ -187,6 +190,29 @@ class PaymentIntegrationTest {
                 .findFirst()
                 .orElseThrow();
         assertThat(payment.getAmount()).isEqualByComparingTo("250.00");
+    }
+
+    @Test
+    @DisplayName("refunding an order that never paid still confirms compensation")
+    void refundWithNothingPaidStillConfirms() throws Exception {
+        UUID orderId = UUID.randomUUID();
+        UUID sagaId = UUID.randomUUID();
+
+        kafkaTemplate.send(PaymentTopics.REFUND_PAYMENT, sagaId.toString(),
+                new RefundPaymentCommand(UUID.randomUUID(), sagaId, orderId));
+
+        PaymentRefundedEvent event = awaitEvent(
+                PaymentTopics.PAYMENT_REFUNDED, PaymentRefundedEvent.class,
+                e -> e.orderId().equals(orderId));
+
+        assertThat(event.outcome()).isEqualTo(CompensationOutcome.NOTHING_TO_REVERSE);
+        assertThat(event.paymentId()).isNull();
+        assertThat(event.amount()).isNull();
+
+        // No payment row invented by the acknowledgement.
+        assertThat(paymentRepository.findAll())
+                .filteredOn(p -> p.getOrderId().equals(orderId))
+                .isEmpty();
     }
 
     @Test

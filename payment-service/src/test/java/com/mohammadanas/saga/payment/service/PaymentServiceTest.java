@@ -14,10 +14,12 @@ import com.mohammadanas.saga.payment.domain.PaymentRepository;
 import com.mohammadanas.saga.payment.domain.PaymentStatus;
 import com.mohammadanas.saga.payment.domain.ProcessedCommand;
 import com.mohammadanas.saga.payment.domain.ProcessedCommandRepository;
+import com.mohammadanas.saga.payment.messaging.CompensationOutcome;
 import com.mohammadanas.saga.payment.messaging.PaymentCompletedEvent;
 import com.mohammadanas.saga.payment.messaging.PaymentEventPublisher;
 import com.mohammadanas.saga.payment.messaging.PaymentFailedEvent;
 import com.mohammadanas.saga.payment.messaging.PaymentFailureReason;
+import com.mohammadanas.saga.payment.messaging.PaymentRefundedEvent;
 import com.mohammadanas.saga.payment.messaging.ProcessPaymentCommand;
 import com.mohammadanas.saga.payment.messaging.RefundPaymentCommand;
 import java.math.BigDecimal;
@@ -189,10 +191,16 @@ class PaymentServiceTest {
             // The amount is untouched: the row records what was taken, and therefore what
             // was given back.
             assertThat(payment.getAmount()).isEqualByComparingTo("99.98");
+
+            ArgumentCaptor<PaymentRefundedEvent> captor = ArgumentCaptor.forClass(PaymentRefundedEvent.class);
+            verify(eventPublisher).publishPaymentRefunded(captor.capture());
+            assertThat(captor.getValue().outcome()).isEqualTo(CompensationOutcome.REVERSED);
+            assertThat(captor.getValue().amount()).isEqualByComparingTo("99.98");
+            assertThat(captor.getValue().paymentId()).isEqualTo(payment.getId());
         }
 
         @Test
-        @DisplayName("a refund with no successful payment is a logged no-op, not an error")
+        @DisplayName("a refund with no successful payment is a no-op, not an error")
         void noRefundablePayment() {
             UUID orderId = UUID.randomUUID();
             RefundPaymentCommand command = refundCommand(orderId);
@@ -222,6 +230,64 @@ class PaymentServiceTest {
             payment.refund();
 
             assertThatThrownBy(payment::refund).isInstanceOf(IllegalStateException.class);
+        }
+    }
+
+    @Nested
+    @DisplayName("compensation is acknowledged even when there was nothing to undo")
+    class CompensationAlwaysAcknowledged {
+
+        @Test
+        @DisplayName("a refund with no successful payment STILL publishes PaymentRefunded")
+        void noRefundablePaymentStillPublishes() {
+            UUID orderId = UUID.randomUUID();
+            RefundPaymentCommand command = refundCommand(orderId);
+            when(processedCommandRepository.existsById(command.messageId())).thenReturn(false);
+            when(paymentRepository.findByOrderIdAndStatus(orderId, PaymentStatus.SUCCEEDED))
+                    .thenReturn(Optional.empty());
+
+            paymentService.refundPayment(command);
+
+            // The behaviour this change exists for, and the common case: most
+            // compensations follow a payment that failed, so there is usually nothing to
+            // refund. Silence would strand every one of those sagas in COMPENSATING.
+            ArgumentCaptor<PaymentRefundedEvent> captor = ArgumentCaptor.forClass(PaymentRefundedEvent.class);
+            verify(eventPublisher).publishPaymentRefunded(captor.capture());
+            assertThat(captor.getValue().orderId()).isEqualTo(orderId);
+            assertThat(captor.getValue().sagaId()).isEqualTo(command.sagaId());
+        }
+
+        @Test
+        @DisplayName("that event is marked NOTHING_TO_REVERSE so the audit trail stays honest")
+        void noOpEventIsDistinguishable() {
+            UUID orderId = UUID.randomUUID();
+            RefundPaymentCommand command = refundCommand(orderId);
+            when(processedCommandRepository.existsById(command.messageId())).thenReturn(false);
+            when(paymentRepository.findByOrderIdAndStatus(orderId, PaymentStatus.SUCCEEDED))
+                    .thenReturn(Optional.empty());
+
+            paymentService.refundPayment(command);
+
+            ArgumentCaptor<PaymentRefundedEvent> captor = ArgumentCaptor.forClass(PaymentRefundedEvent.class);
+            verify(eventPublisher).publishPaymentRefunded(captor.capture());
+
+            PaymentRefundedEvent event = captor.getValue();
+            assertThat(event.outcome()).isEqualTo(CompensationOutcome.NOTHING_TO_REVERSE);
+            assertThat(event.paymentId()).isNull();
+            // Null rather than zero: "no refund applied", not "refunded nothing".
+            assertThat(event.amount()).isNull();
+        }
+
+        @Test
+        @DisplayName("a redelivered RefundPayment stays silent — the same outcome, not a new one")
+        void duplicateStaysSilent() {
+            RefundPaymentCommand command = refundCommand(UUID.randomUUID());
+            when(processedCommandRepository.existsById(command.messageId())).thenReturn(true);
+
+            CommandOutcome outcome = paymentService.refundPayment(command);
+
+            assertThat(outcome).isEqualTo(CommandOutcome.DUPLICATE_IGNORED);
+            verifyNoInteractions(eventPublisher);
         }
     }
 

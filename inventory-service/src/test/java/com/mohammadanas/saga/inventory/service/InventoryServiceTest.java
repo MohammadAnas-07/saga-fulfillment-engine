@@ -14,6 +14,7 @@ import com.mohammadanas.saga.inventory.domain.ProcessedCommandRepository;
 import com.mohammadanas.saga.inventory.domain.Reservation;
 import com.mohammadanas.saga.inventory.domain.ReservationRepository;
 import com.mohammadanas.saga.inventory.domain.ReservationStatus;
+import com.mohammadanas.saga.inventory.messaging.CompensationOutcome;
 import com.mohammadanas.saga.inventory.messaging.InventoryEventPublisher;
 import com.mohammadanas.saga.inventory.messaging.InventoryReleasedEvent;
 import com.mohammadanas.saga.inventory.messaging.InventoryReservationFailedEvent;
@@ -194,10 +195,12 @@ class InventoryServiceTest {
             ArgumentCaptor<InventoryReleasedEvent> captor = ArgumentCaptor.forClass(InventoryReleasedEvent.class);
             verify(eventPublisher).publishInventoryReleased(captor.capture());
             assertThat(captor.getValue().quantity()).isEqualTo(3);
+            assertThat(captor.getValue().item()).isEqualTo(ITEM);
+            assertThat(captor.getValue().outcome()).isEqualTo(CompensationOutcome.REVERSED);
         }
 
         @Test
-        @DisplayName("release with no active reservation is a logged no-op, not an error")
+        @DisplayName("release with no active reservation is a no-op, not an error")
         void noActiveReservation() {
             UUID orderId = UUID.randomUUID();
             ReleaseInventoryCommand command = releaseCommand(orderId);
@@ -208,6 +211,66 @@ class InventoryServiceTest {
             CommandOutcome outcome = inventoryService.release(command);
 
             assertThat(outcome).isEqualTo(CommandOutcome.NO_ACTIVE_RESERVATION);
+            verify(inventoryRepository, never()).save(any(Inventory.class));
+        }
+    }
+
+    @Nested
+    @DisplayName("compensation is acknowledged even when there was nothing to undo")
+    class CompensationAlwaysAcknowledged {
+
+        @Test
+        @DisplayName("release with no active reservation STILL publishes InventoryReleased")
+        void noActiveReservationStillPublishes() {
+            UUID orderId = UUID.randomUUID();
+            ReleaseInventoryCommand command = releaseCommand(orderId);
+            when(processedCommandRepository.existsById(command.messageId())).thenReturn(false);
+            when(reservationRepository.findByOrderIdAndStatus(orderId, ReservationStatus.RESERVED))
+                    .thenReturn(Optional.empty());
+
+            inventoryService.release(command);
+
+            // The behaviour this change exists for. Silence here would strand the saga in
+            // COMPENSATING forever, waiting on an acknowledgement that never comes.
+            ArgumentCaptor<InventoryReleasedEvent> captor =
+                    ArgumentCaptor.forClass(InventoryReleasedEvent.class);
+            verify(eventPublisher).publishInventoryReleased(captor.capture());
+            assertThat(captor.getValue().orderId()).isEqualTo(orderId);
+            assertThat(captor.getValue().sagaId()).isEqualTo(command.sagaId());
+        }
+
+        @Test
+        @DisplayName("that event is marked NOTHING_TO_REVERSE so the audit trail stays honest")
+        void noOpEventIsDistinguishable() {
+            UUID orderId = UUID.randomUUID();
+            ReleaseInventoryCommand command = releaseCommand(orderId);
+            when(processedCommandRepository.existsById(command.messageId())).thenReturn(false);
+            when(reservationRepository.findByOrderIdAndStatus(orderId, ReservationStatus.RESERVED))
+                    .thenReturn(Optional.empty());
+
+            inventoryService.release(command);
+
+            ArgumentCaptor<InventoryReleasedEvent> captor =
+                    ArgumentCaptor.forClass(InventoryReleasedEvent.class);
+            verify(eventPublisher).publishInventoryReleased(captor.capture());
+
+            InventoryReleasedEvent event = captor.getValue();
+            assertThat(event.outcome()).isEqualTo(CompensationOutcome.NOTHING_TO_REVERSE);
+            assertThat(event.quantity()).isZero();
+            assertThat(event.item()).isNull();
+        }
+
+        @Test
+        @DisplayName("a redelivered ReleaseInventory stays silent — the same outcome, not a new one")
+        void duplicateStaysSilent() {
+            ReleaseInventoryCommand command = releaseCommand(UUID.randomUUID());
+            when(processedCommandRepository.existsById(command.messageId())).thenReturn(true);
+
+            CommandOutcome outcome = inventoryService.release(command);
+
+            // The deliberate exception: idempotency exists to suppress a repeated report
+            // of an outcome already acknowledged.
+            assertThat(outcome).isEqualTo(CommandOutcome.DUPLICATE_IGNORED);
             verifyNoInteractions(eventPublisher);
         }
     }
