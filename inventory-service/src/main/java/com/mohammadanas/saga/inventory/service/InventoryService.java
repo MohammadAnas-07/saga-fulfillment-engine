@@ -109,9 +109,16 @@ public class InventoryService {
                 reservationRepository.findByOrderIdAndStatus(command.orderId(), ReservationStatus.RESERVED);
 
         if (maybeReservation.isEmpty()) {
-            log.warn("ReleaseInventory (messageId={}) for order {}: no active reservation to reverse",
+            // Still a completed compensation, so it must still be acknowledged. Staying
+            // silent here would strand the saga in COMPENSATING forever.
+            log.warn("ReleaseInventory (messageId={}) for order {}: no active reservation to reverse; "
+                            + "confirming compensation anyway",
                     command.messageId(), command.orderId());
             markProcessed(command.messageId(), RELEASE_INVENTORY);
+
+            eventPublisher.publishInventoryReleased(
+                    InventoryReleasedEvent.nothingToReverse(command.sagaId(), command.orderId()));
+
             return CommandOutcome.NO_ACTIVE_RESERVATION;
         }
 
@@ -126,7 +133,7 @@ public class InventoryService {
         reservationRepository.save(reservation);
         markProcessed(command.messageId(), RELEASE_INVENTORY);
 
-        eventPublisher.publishInventoryReleased(InventoryReleasedEvent.from(
+        eventPublisher.publishInventoryReleased(InventoryReleasedEvent.reversed(
                 command.sagaId(), command.orderId(), reservation.getItemId(), reservation.getQuantity()));
 
         log.info("Released {} of {} for order {} ({} available, {} reserved)",

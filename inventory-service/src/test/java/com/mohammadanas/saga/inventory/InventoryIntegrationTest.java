@@ -9,6 +9,8 @@ import com.mohammadanas.saga.inventory.domain.InventoryRepository;
 import com.mohammadanas.saga.inventory.domain.ProcessedCommandRepository;
 import com.mohammadanas.saga.inventory.domain.ReservationRepository;
 import com.mohammadanas.saga.inventory.domain.ReservationStatus;
+import com.mohammadanas.saga.inventory.messaging.CompensationOutcome;
+import com.mohammadanas.saga.inventory.messaging.InventoryReleasedEvent;
 import com.mohammadanas.saga.inventory.messaging.InventoryReservationFailedEvent;
 import com.mohammadanas.saga.inventory.messaging.InventoryReservedEvent;
 import com.mohammadanas.saga.inventory.messaging.InventoryTopics;
@@ -189,6 +191,28 @@ class InventoryIntegrationTest {
         await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
                 assertThat(reservationRepository.findByOrderIdAndStatus(orderId, ReservationStatus.RESERVED))
                         .isEmpty());
+    }
+
+    @Test
+    @DisplayName("releasing an order that never reserved still confirms compensation")
+    void releaseWithNothingReservedStillConfirms() throws Exception {
+        UUID orderId = UUID.randomUUID();
+        UUID sagaId = UUID.randomUUID();
+
+        kafkaTemplate.send(InventoryTopics.RELEASE_INVENTORY, orderId.toString(),
+                new ReleaseInventoryCommand(UUID.randomUUID(), sagaId, orderId));
+
+        InventoryReleasedEvent event = awaitEvent(
+                InventoryTopics.INVENTORY_RELEASED, InventoryReleasedEvent.class,
+                e -> e.orderId().equals(orderId));
+
+        assertThat(event.outcome()).isEqualTo(CompensationOutcome.NOTHING_TO_REVERSE);
+        assertThat(event.quantity()).isZero();
+
+        // Stock untouched — the acknowledgement is not a side effect.
+        Inventory inventory = inventoryRepository.findById(ITEM).orElseThrow();
+        assertThat(inventory.getAvailableQuantity()).isEqualTo(10);
+        assertThat(inventory.getReservedQuantity()).isZero();
     }
 
     @Test

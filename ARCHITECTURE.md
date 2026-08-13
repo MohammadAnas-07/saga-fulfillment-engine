@@ -170,6 +170,18 @@ back.
 5. Once compensation is confirmed, **saga-orchestrator** moves the saga
    **`COMPENSATING` → `CANCELLED`**. Saga is terminal.
 
+> **`COMPENSATING` → `CANCELLED` waits for acknowledgements, and they always arrive.**
+> The orchestrator leaves `COMPENSATING` only once every compensating command it issued
+> has been confirmed — `InventoryReleased` for `ReleaseInventory`, and `PaymentRefunded`
+> for `RefundPayment` (§3.5). This is what makes the state honest: a saga in
+> `COMPENSATING` genuinely means "an undo is still outstanding".
+>
+> That only works because those confirmations are **unconditional**. Both services publish
+> them on every terminal outcome, including the no-op ones where there was nothing to undo
+> — see §5.3.1. An earlier version of both handlers stayed silent on their no-op paths,
+> which would have stranded a compensating saga forever in exactly the most common case:
+> payment failed, so there was no payment to refund.
+
 > The saga only reaches `CANCELLED` **after** compensation is acknowledged. A saga
 > sitting in `COMPENSATING` means inventory has not yet been confirmed released — that
 > distinction is what makes the state machine worth having, and it is exactly what §8
@@ -305,8 +317,38 @@ of being an emergent property of who happens to subscribe to what.
 | `inventory.events.inventory-released.v1` | inventory-service |
 | `payment.events.payment-completed.v1` | payment-service |
 | `payment.events.payment-failed.v1` | payment-service |
+| `payment.events.payment-refunded.v1` | payment-service (compensation confirmation) |
 | `order.events.order-confirmed.v1` | order-service |
 | `order.events.order-cancelled.v1` | order-service |
+
+### 5.3.1 Compensation confirmations are unconditional
+
+`InventoryReleased` and `PaymentRefunded` are **compensation confirmations**, and they
+carry identical semantics on purpose: *compensation for this order is complete, stop
+waiting.*
+
+Both are published on **every terminal outcome** of their handler, including the outcomes
+where there was nothing to undo — no active reservation, no successful payment. That is
+not a technicality. Most compensations follow a payment that failed, so "nothing to
+refund" is the **common** case, not the edge case; a handler that stayed silent there
+would strand the majority of compensating sagas in `COMPENSATING` forever, waiting on an
+acknowledgement that was never going to come.
+
+Each event carries a `CompensationOutcome`:
+
+| Value | Meaning |
+| --- | --- |
+| `REVERSED` | There was something to undo, and it was undone. |
+| `NOTHING_TO_REVERSE` | There was nothing to undo. Equally final. |
+
+The orchestrator treats both identically when leaving `COMPENSATING`. The distinction
+exists purely so the audit trail can still tell the two apart — a saga that returned real
+stock and a saga that had never reserved any are equally finished, but they are not the
+same story.
+
+**The one exception is a redelivered `messageId`, which publishes nothing.** That is not a
+new outcome; it is the same outcome arriving twice, which is exactly what the idempotency
+guard of §6 exists to suppress. The original confirmation was already sent.
 
 ### 5.4 Partitioning and ordering
 

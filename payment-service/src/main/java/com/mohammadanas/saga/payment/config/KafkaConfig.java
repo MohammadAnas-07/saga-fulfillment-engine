@@ -30,4 +30,9 @@ public class KafkaConfig {
     public NewTopic paymentFailedTopic() {
         return TopicBuilder.name(PaymentTopics.PAYMENT_FAILED).partitions(3).replicas(1).build();
     }
+
+    @Bean
+    public NewTopic paymentRefundedTopic() {
+        return TopicBuilder.name(PaymentTopics.PAYMENT_REFUNDED).partitions(3).replicas(1).build();
+    }
 }

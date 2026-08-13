@@ -14,6 +14,12 @@ public final class PaymentTopics {
     public static final String PAYMENT_COMPLETED = "payment.events.payment-completed.v1";
     public static final String PAYMENT_FAILED = "payment.events.payment-failed.v1";
 
+    /**
+     * Confirms compensation is complete, mirroring
+     * {@code inventory.events.inventory-released.v1}.
+     */
+    public static final String PAYMENT_REFUNDED = "payment.events.payment-refunded.v1";
+
     private PaymentTopics() {
     }
 }

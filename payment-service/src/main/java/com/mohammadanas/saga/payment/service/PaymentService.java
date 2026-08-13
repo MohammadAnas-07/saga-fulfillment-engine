@@ -10,6 +10,7 @@ import com.mohammadanas.saga.payment.messaging.PaymentCompletedEvent;
 import com.mohammadanas.saga.payment.messaging.PaymentEventPublisher;
 import com.mohammadanas.saga.payment.messaging.PaymentFailedEvent;
 import com.mohammadanas.saga.payment.messaging.PaymentFailureReason;
+import com.mohammadanas.saga.payment.messaging.PaymentRefundedEvent;
 import com.mohammadanas.saga.payment.messaging.ProcessPaymentCommand;
 import com.mohammadanas.saga.payment.messaging.RefundPaymentCommand;
 import java.util.Optional;
@@ -105,10 +106,16 @@ public class PaymentService {
 
         if (maybePayment.isEmpty()) {
             // Legitimate and common: the saga may have failed before payment ran, or the
-            // payment itself failed. There is simply nothing to give back.
-            log.warn("RefundPayment (messageId={}) for order {}: no successful payment to reverse",
+            // payment itself failed. There is nothing to give back — but compensation is
+            // still complete, and staying silent would strand the saga in COMPENSATING.
+            log.warn("RefundPayment (messageId={}) for order {}: no successful payment to reverse; "
+                            + "confirming compensation anyway",
                     command.messageId(), command.orderId());
             markProcessed(command.messageId(), REFUND_PAYMENT);
+
+            eventPublisher.publishPaymentRefunded(
+                    PaymentRefundedEvent.nothingToReverse(command.sagaId(), command.orderId()));
+
             return CommandOutcome.NO_REFUNDABLE_PAYMENT;
         }
 
@@ -116,6 +123,9 @@ public class PaymentService {
         payment.refund();
         paymentRepository.save(payment);
         markProcessed(command.messageId(), REFUND_PAYMENT);
+
+        eventPublisher.publishPaymentRefunded(PaymentRefundedEvent.reversed(
+                command.sagaId(), command.orderId(), payment.getId(), payment.getAmount()));
 
         log.info("Refunded payment {} for order {}: amount {}",
                 payment.getId(), command.orderId(), payment.getAmount());
