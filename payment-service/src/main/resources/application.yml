@@ -1,3 +1,44 @@
 spring:
   application:
     name: payment-service
+
+  datasource:
+    # payment-service owns its own database.
+    url: ${PAYMENT_DB_URL:jdbc:postgresql://localhost:5432/payment_db}
+    username: ${PAYMENT_DB_USER:payment_service}
+    password: ${PAYMENT_DB_PASSWORD:payment_service}
+
+  jpa:
+    hibernate:
+      # Fine for a portfolio project. A real deployment would use Flyway/Liquibase
+      # migrations and set this to `validate`.
+      ddl-auto: update
+    open-in-view: false
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      properties:
+        spring.json.add.type.headers: false
+      acks: all
+    consumer:
+      group-id: ${PAYMENT_CONSUMER_GROUP:payment-service}
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+
+payment:
+  simulation:
+    # Payments STRICTLY ABOVE this amount fail; the boundary value itself succeeds.
+    # To demo the compensation path, order a total above it (e.g. unitPrice 600 x
+    # quantity 2 = 1200.00). Set to 0 to make every payment fail.
+    failure-threshold: ${PAYMENT_FAILURE_THRESHOLD:1000.00}
+
+server:
+  port: ${PAYMENT_SERVICE_PORT:8083}
+
+logging:
+  level:
+    com.mohammadanas.saga.payment: INFO
