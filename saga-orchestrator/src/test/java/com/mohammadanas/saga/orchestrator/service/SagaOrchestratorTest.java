@@ -8,6 +8,8 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import com.mohammadanas.saga.orchestrator.config.SagaProperties;
+import com.mohammadanas.saga.orchestrator.domain.ProcessedMessage;
+import com.mohammadanas.saga.orchestrator.domain.ProcessedMessageRepository;
 import com.mohammadanas.saga.orchestrator.domain.Saga;
 import com.mohammadanas.saga.orchestrator.domain.SagaRepository;
 import com.mohammadanas.saga.orchestrator.domain.SagaStatus;
@@ -60,6 +62,9 @@ class SagaOrchestratorTest {
     private SagaStepRepository sagaStepRepository;
 
     @Mock
+    private ProcessedMessageRepository processedMessageRepository;
+
+    @Mock
     private SagaCommandPublisher publisher;
 
     private SagaProperties properties;
@@ -70,7 +75,7 @@ class SagaOrchestratorTest {
         properties = new SagaProperties();
         properties.setTimeout(TIMEOUT);
         orchestrator = new SagaOrchestrator(
-                sagaRepository, sagaStepRepository, publisher, properties,
+                sagaRepository, sagaStepRepository, processedMessageRepository, publisher, properties,
                 Clock.fixed(NOW, ZoneOffset.UTC));
     }
 
@@ -376,6 +381,152 @@ class SagaOrchestratorTest {
                     UUID.randomUUID(), sagaId, UUID.randomUUID(), ITEM_SKU, 2, NOW)))
                     .isEqualTo(SagaOutcome.UNKNOWN_SAGA);
             verifyNoInteractions(publisher);
+        }
+    }
+
+    /**
+     * Reply-side dedup (ARCHITECTURE.md section 6).
+     *
+     * <p>The state-machine guard in {@link InvalidTransitions} already drops a reply that
+     * does not fit the current status, and that covers the *common* duplicate. These tests
+     * cover what it cannot: a message identified as already handled, regardless of whether
+     * the saga happens to be in a status that would accept it. Status and identity are
+     * different questions, and only the second one distinguishes "this happened twice" from
+     * "this happened once and I am seeing it twice".
+     */
+    @Nested
+    @DisplayName("idempotency — a redelivered message is not handled twice")
+    class Idempotency {
+
+        /** The case section 6 names outright: a duplicated PaymentCompleted. */
+        @Test
+        @DisplayName("a redelivered PaymentCompleted does not issue a second ConfirmOrder")
+        void redeliveredPaymentCompletedIssuesNoSecondConfirmOrder() {
+            UUID messageId = UUID.randomUUID();
+            Saga saga = sagaIn(SagaStatus.AWAITING_PAYMENT);
+            when(processedMessageRepository.existsById(messageId)).thenReturn(true);
+
+            SagaOutcome outcome = orchestrator.onPaymentCompleted(new InboundEvents.PaymentCompleted(
+                    messageId, saga.getId(), saga.getOrderId(), UUID.randomUUID(), AMOUNT, NOW));
+
+            assertThat(outcome).isEqualTo(SagaOutcome.IGNORED_REDELIVERY);
+            verify(publisher, never()).confirmOrder(any());
+
+            // The saga was never even loaded: dedup runs in front of the state machine, so
+            // a redelivery costs one indexed lookup and touches nothing else.
+            verify(sagaRepository, never()).findById(any());
+            verifyNoInteractions(sagaStepRepository);
+        }
+
+        @Test
+        @DisplayName("the guard fires even when the saga's status would still accept the reply")
+        void redeliveryIgnoredEvenWhenStatusWouldAcceptIt() {
+            UUID messageId = UUID.randomUUID();
+            Saga saga = sagaIn(SagaStatus.AWAITING_INVENTORY);
+            when(processedMessageRepository.existsById(messageId)).thenReturn(true);
+
+            // AWAITING_INVENTORY is exactly the status InventoryReserved is valid from, so
+            // the status guard would let this through. This is the gap the table closes:
+            // two deliveries landing before the first transition is visible.
+            SagaOutcome outcome = orchestrator.onInventoryReserved(new InboundEvents.InventoryReserved(
+                    messageId, saga.getId(), saga.getOrderId(), ITEM_SKU, 2, NOW));
+
+            assertThat(outcome).isEqualTo(SagaOutcome.IGNORED_REDELIVERY);
+            verify(publisher, never()).processPayment(any());
+        }
+
+        @Test
+        @DisplayName("a redelivered OrderCreated does not start a second saga")
+        void redeliveredOrderCreatedStartsNoSaga() {
+            InboundEvents.OrderCreated event = orderCreated(UUID.randomUUID());
+            when(processedMessageRepository.existsById(event.messageId())).thenReturn(true);
+
+            assertThat(orchestrator.onOrderCreated(event)).isEqualTo(SagaOutcome.IGNORED_REDELIVERY);
+            verify(sagaRepository, never()).save(any(Saga.class));
+            verifyNoInteractions(publisher);
+        }
+
+        @Test
+        @DisplayName("a handled reply is marked processed, under its own event type")
+        void handledReplyIsMarkedProcessed() {
+            UUID messageId = UUID.randomUUID();
+            Saga saga = sagaIn(SagaStatus.AWAITING_PAYMENT);
+            when(sagaRepository.findById(saga.getId())).thenReturn(Optional.of(saga));
+
+            orchestrator.onPaymentCompleted(new InboundEvents.PaymentCompleted(
+                    messageId, saga.getId(), saga.getOrderId(), UUID.randomUUID(), AMOUNT, NOW));
+
+            ArgumentCaptor<ProcessedMessage> captor = ArgumentCaptor.forClass(ProcessedMessage.class);
+            verify(processedMessageRepository).save(captor.capture());
+
+            assertThat(captor.getValue().getMessageId()).isEqualTo(messageId);
+            assertThat(captor.getValue().getEventType()).isEqualTo("PaymentCompleted");
+        }
+
+        @Test
+        @DisplayName("a reply rejected by the transition guard is still marked, so redelivery stays quiet")
+        void rejectedReplyIsStillMarkedProcessed() {
+            UUID messageId = UUID.randomUUID();
+            Saga saga = sagaIn(SagaStatus.CANCELLED);
+            when(sagaRepository.findById(saga.getId())).thenReturn(Optional.of(saga));
+
+            assertThat(orchestrator.onPaymentCompleted(new InboundEvents.PaymentCompleted(
+                    messageId, saga.getId(), saga.getOrderId(), UUID.randomUUID(), AMOUNT, NOW)))
+                    .isEqualTo(SagaOutcome.IGNORED_INVALID_TRANSITION);
+
+            // It was handled; the answer was "no". Marking it keeps a flaky broker from
+            // appending a fresh "(ignored)" step to the audit trail on every redelivery.
+            verify(processedMessageRepository).save(any(ProcessedMessage.class));
+        }
+
+        @Test
+        @DisplayName("a reply for an unknown saga is NOT marked, so it stays eligible for redelivery")
+        void unknownSagaIsNotMarkedProcessed() {
+            UUID sagaId = UUID.randomUUID();
+            when(sagaRepository.findById(sagaId)).thenReturn(Optional.empty());
+
+            assertThat(orchestrator.onInventoryReserved(new InboundEvents.InventoryReserved(
+                    UUID.randomUUID(), sagaId, UUID.randomUUID(), ITEM_SKU, 2, NOW)))
+                    .isEqualTo(SagaOutcome.UNKNOWN_SAGA);
+
+            // Nothing changed, so there is nothing to protect — and swallowing the message
+            // would strand a reply whose saga was merely not visible yet.
+            verify(processedMessageRepository, never()).save(any(ProcessedMessage.class));
+        }
+
+        @Test
+        @DisplayName("an OrderCreated that starts a saga is marked processed")
+        void startedSagaMarksOrderCreatedProcessed() {
+            UUID orderId = UUID.randomUUID();
+            InboundEvents.OrderCreated event = orderCreated(orderId);
+            when(sagaRepository.findByOrderId(orderId)).thenReturn(Optional.empty());
+            when(sagaRepository.save(any(Saga.class))).thenAnswer(inv -> inv.getArgument(0));
+
+            assertThat(orchestrator.onOrderCreated(event)).isEqualTo(SagaOutcome.ADVANCED);
+
+            ArgumentCaptor<ProcessedMessage> captor = ArgumentCaptor.forClass(ProcessedMessage.class);
+            verify(processedMessageRepository).save(captor.capture());
+            assertThat(captor.getValue().getMessageId()).isEqualTo(event.messageId());
+            assertThat(captor.getValue().getEventType()).isEqualTo("OrderCreated");
+        }
+
+        @Test
+        @DisplayName("each compensation confirmation is marked under its own event type")
+        void compensationConfirmationsAreMarkedDistinctly() {
+            Saga inventorySaga = sagaIn(SagaStatus.COMPENSATING);
+            inventorySaga.awaitInventoryRelease();
+            when(sagaRepository.findById(inventorySaga.getId())).thenReturn(Optional.of(inventorySaga));
+
+            orchestrator.onInventoryReleased(new InboundEvents.InventoryReleased(
+                    UUID.randomUUID(), inventorySaga.getId(), inventorySaga.getOrderId(),
+                    ITEM_SKU, 2, "REVERSED", NOW));
+
+            ArgumentCaptor<ProcessedMessage> captor = ArgumentCaptor.forClass(ProcessedMessage.class);
+            verify(processedMessageRepository).save(captor.capture());
+
+            // The event type is recorded for the audit trail, not for the guard — the
+            // message id alone is the key, exactly as in the other three services.
+            assertThat(captor.getValue().getEventType()).isEqualTo("InventoryReleased");
         }
     }
 

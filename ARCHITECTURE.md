@@ -6,12 +6,12 @@ scheduler that drives timeout-based compensation for sagas that stall.
 This document is the design reference for the project. It is updated in the same commit
 as any change that affects design.
 
-**Status:** Chunks 0–5.5 complete. **The system is connected end to end**: an order created
+**Status:** Chunks 0–6 complete. **The system is connected end to end**: an order created
 over REST drives the full saga through inventory and payment and back, and the terminal
-outcome reaches the customer as a notification. Every topic in §5.3 now has both a producer
-and a consumer. What remains is hardening and operability — orchestrator-side dedup
-(Chunk 6), the timeout sweep (Chunk 7), the integration suite (Chunk 8), and a local run
-setup (Chunk 9).
+outcome reaches the customer as a notification. Every topic in §5.3 has both a producer and
+a consumer, and every consumer in the system now dedups on message id (§6). What remains is
+the timeout sweep (Chunk 7), the integration suite (Chunk 8), and a local run setup
+(Chunk 9).
 
 > **"End to end" here means every link is implemented and unit-tested, not that the whole
 > chain has been observed running.** The Testcontainers suites that would prove that have
@@ -490,9 +490,10 @@ local transaction** as the business change, so the dedup record and the effect c
 atomically or not at all — a marker able to commit without its effect would permanently
 suppress a command that never took place.
 
-**Implemented in `inventory-service` (Chunk 2), `payment-service` (Chunk 3), and
+**Implemented in `inventory-service` (Chunk 2), `payment-service` (Chunk 3),
 `notification-service` (Chunk 4** — as `processed_messages`, since it consumes events
-rather than commands**),** all with the same message-id primary key. A duplicate is a logged no-op that
+rather than commands**), and `saga-orchestrator` (Chunk 6),** all with the same message-id
+primary key. Every consumer in the system now has one. A duplicate is a logged no-op that
 does **not** re-publish the original result. If the original reply was genuinely
 lost, the saga stalls and the §4 timeout sweep is what recovers it; re-publishing from a
 stored outcome is a possible refinement, deliberately not built, because it would
@@ -506,10 +507,37 @@ never done twice.
 The same applies to compensating commands — §4 notes that compensation is reachable from
 both an explicit failure and a timeout, so `ReleaseInventory` can genuinely arrive twice.
 
-`saga-orchestrator` needs the equivalent protection on the reply side: a duplicated
-`PaymentCompleted` must not drive a second `OrderConfirmed`. Its state machine helps here
-(a transition out of `CONFIRMED` is already invalid) but explicit dedup is still the
-clearer guarantee.
+`saga-orchestrator` has the equivalent protection on the reply side **as of Chunk 6**: a
+duplicated `PaymentCompleted` must not drive a second `OrderConfirmed`. Same
+`processed_messages` table, same message-id primary key, written in the same transaction as
+the transition.
+
+Its state machine already helped — a transition out of `CONFIRMED` is invalid, so a late
+reply was dropped — but the two guards answer different questions, and the difference is
+not cosmetic:
+
+- The **status guard** asks *"does this reply fit where the saga is now?"*
+- The **dedup table** asks *"have I already handled this exact message?"*
+
+The gap between them is two deliveries of the same reply that both arrive while the saga is
+still in the status that reply is valid from. Both pass the status check, and the machine
+advances twice — issuing the next command twice. Sequentially the first delivery's
+transition closes that window; concurrently it does not, which is why the primary key and
+not the lookup is the real guarantee.
+
+**The guard runs in front of the state machine**, so a redelivery costs one indexed lookup
+and touches nothing else — no saga load, no step appended. Two deliberate asymmetries:
+
+| Path | Marked processed? | Why |
+| --- | --- | --- |
+| Handled, or rejected by the status guard | **Yes** | It was handled; the answer was "no". Leaving it unmarked would append a fresh `(ignored)` step to the append-only history on every redelivery — a flakier broker would mean a noisier audit trail. |
+| `UNKNOWN_SAGA` | **No** | Nothing changed, so there is nothing to protect, and swallowing the id would permanently suppress a reply whose saga was merely not visible yet. Replaying it costs a log line. |
+
+The guard covers the trigger event as well as the six replies, not just "the reply side" as
+this section originally scoped it. One rule for *have I seen this message* is easier to
+reason about than one rule with an exception, and `OrderCreated`'s existing `orderId`
+lookup stays — it catches a genuinely different thing, a *second* `OrderCreated` for the
+same order, which is a different message with a different id rather than a redelivery.
 
 ### 6.1 order-service is a special case
 
@@ -711,9 +739,9 @@ Update after every chunk.
       reintroduced.
       **`COMPENSATING` → `CANCELLED` waits for confirmations** rather than marking
       optimistically — see §3.3.
-      **Not yet idempotent** on the reply side: dedup is Chunk 6. The state-machine guard
-      rejects replies invalid from the current status, which covers the common duplicate,
-      but it is not a substitute for a `processed_messages` table.
+      **~~Not yet idempotent~~ on the reply side — closed by Chunk 6.** The state-machine
+      guard rejects replies invalid from the current status, which covers the common
+      duplicate, but it was never a substitute for a `processed_messages` table.
       **No Testcontainers suite** for this module — deliberately, see Chunk 8.
 - [x] **Chunk 5.5 — order-service terminal-state events. The system is now connected end
       to end.** order-service publishes `OrderConfirmed` when it applies `ConfirmOrder` and
@@ -745,11 +773,27 @@ Update after every chunk.
       payload contract, which was the actual risk. It does **not** cover the broker path
       itself — partition keys, offsets, listener wiring — which the integration tests
       written here cover and which stay unrun until Chunk 8.
-- [ ] **Chunk 6 — idempotency (orchestrator only).** Dedup on the orchestrator's reply
+- [x] **Chunk 6 — idempotency (orchestrator only).** Dedup on the orchestrator's reply
       side (§6): a duplicated `PaymentCompleted` must not drive a second `OrderConfirmed`.
-      inventory-service's landed in Chunk 2 and payment-service's in Chunk 3, so this is
-      all that remains. Still ahead of scheduler-service because §4 compensation is
-      reachable from both an explicit failure and a timeout.
+      inventory-service's landed in Chunk 2 and payment-service's in Chunk 3, so this was
+      all that remained. Kept ahead of scheduler-service because §4 compensation is
+      reachable from both an explicit failure and a timeout. *Branch:
+      `feature/orchestrator-idempotency`.*
+      **Same table, same key, same transaction** as the other three services —
+      `processed_messages` with a message-id primary key, written alongside the transition.
+      **Widened past "the reply side"** to cover `OrderCreated` too, so there is one rule
+      for message identity rather than one rule with an exception; §6 records why, and the
+      existing `orderId` guard stays because it catches a different thing.
+      **The status guard was not enough, and §6 now says why** rather than leaving it at
+      "explicit dedup is clearer": status and identity are different questions, and two
+      concurrent deliveries of a reply valid from the current status pass the status check.
+      The primary key, not the lookup, is what closes it.
+      **`UNKNOWN_SAGA` is deliberately not marked**, so a reply whose saga is not yet
+      visible stays eligible for redelivery.
+      **No Testcontainers suite** for this module still — see Chunk 8. The
+      database-enforced half of the guarantee (the primary key under genuine concurrency)
+      is therefore asserted in design but unverified in execution, exactly as it is in
+      Chunks 2 and 3.
 - [ ] **Chunk 7 — scheduler-service.** Timeout sweep, orchestrator query API, Redis
       distributed lock, compensation trigger (§4). *Branch: `feature/scheduler-service`.*
 - [ ] **Chunk 8 — integration test suite.** Testcontainers harness plus all seven
