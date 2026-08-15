@@ -3,12 +3,17 @@ package com.mohammadanas.saga.order.service;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.mohammadanas.saga.order.domain.Order;
 import com.mohammadanas.saga.order.domain.OrderRepository;
 import com.mohammadanas.saga.order.domain.OrderStatus;
+import com.mohammadanas.saga.order.messaging.CancelOrderCommand;
+import com.mohammadanas.saga.order.messaging.ConfirmOrderCommand;
+import com.mohammadanas.saga.order.messaging.OrderCancelledEvent;
+import com.mohammadanas.saga.order.messaging.OrderConfirmedEvent;
 import com.mohammadanas.saga.order.messaging.OrderCreatedEvent;
 import com.mohammadanas.saga.order.messaging.OrderEventPublisher;
 import java.math.BigDecimal;
@@ -56,6 +61,14 @@ class OrderServiceTest {
             order.transitionTo(status);
         }
         return order;
+    }
+
+    private static ConfirmOrderCommand confirm(UUID orderId) {
+        return new ConfirmOrderCommand(UUID.randomUUID(), UUID.randomUUID(), orderId);
+    }
+
+    private static CancelOrderCommand cancel(UUID orderId) {
+        return new CancelOrderCommand(UUID.randomUUID(), UUID.randomUUID(), orderId);
     }
 
     @Nested
@@ -184,7 +197,7 @@ class OrderServiceTest {
             when(orderRepository.findById(order.getId())).thenReturn(Optional.of(order));
             when(orderRepository.save(any(Order.class))).thenAnswer(inv -> inv.getArgument(0));
 
-            CommandOutcome outcome = orderService.confirmOrder(order.getId(), UUID.randomUUID());
+            CommandOutcome outcome = orderService.confirmOrder(confirm(order.getId()));
 
             assertThat(outcome).isEqualTo(CommandOutcome.APPLIED);
             assertThat(order.getStatus()).isEqualTo(OrderStatus.CONFIRMED);
@@ -198,11 +211,110 @@ class OrderServiceTest {
             when(orderRepository.findById(order.getId())).thenReturn(Optional.of(order));
             when(orderRepository.save(any(Order.class))).thenAnswer(inv -> inv.getArgument(0));
 
-            CommandOutcome outcome = orderService.cancelOrder(order.getId(), UUID.randomUUID());
+            CommandOutcome outcome = orderService.cancelOrder(cancel(order.getId()));
 
             assertThat(outcome).isEqualTo(CommandOutcome.APPLIED);
             assertThat(order.getStatus()).isEqualTo(OrderStatus.CANCELLED);
             verify(orderRepository).save(order);
+        }
+    }
+
+    /**
+     * The terminal-state events, and specifically the payload notification-service needs.
+     *
+     * <p>Before this chunk both topics had a complete consumer and no producer at all
+     * (ARCHITECTURE.md section 5.3), so these assertions are the first thing anywhere that
+     * checks the two halves agree. They assert the <em>values</em>; the JSON field names
+     * they travel under are pinned separately by {@code TerminalEventContractTest}.
+     */
+    @Nested
+    @DisplayName("terminal-state events")
+    class PublishesTerminalStateEvents {
+
+        @Test
+        @DisplayName("ConfirmOrder publishes OrderConfirmed with everything notification-service renders")
+        void confirmPublishesOrderConfirmed() {
+            Order order = orderIn(OrderStatus.PENDING);
+            when(orderRepository.findById(order.getId())).thenReturn(Optional.of(order));
+            when(orderRepository.save(any(Order.class))).thenAnswer(inv -> inv.getArgument(0));
+
+            ConfirmOrderCommand command = confirm(order.getId());
+            orderService.confirmOrder(command);
+
+            ArgumentCaptor<OrderConfirmedEvent> captor = ArgumentCaptor.forClass(OrderConfirmedEvent.class);
+            verify(eventPublisher).publishOrderConfirmed(captor.capture());
+            OrderConfirmedEvent event = captor.getValue();
+
+            // sagaId can only come from the command — order-service holds no saga state.
+            assertThat(event.sagaId()).isEqualTo(command.sagaId());
+            assertThat(event.orderId()).isEqualTo(order.getId());
+
+            // Who to tell, and what about. notification-service reads exactly these three.
+            assertThat(event.userId()).isEqualTo(USER_ID);
+            assertThat(event.item()).isEqualTo(ITEM);
+            assertThat(event.amount()).isEqualByComparingTo(EXPECTED_TOTAL);
+
+            // A fresh messageId, not the command's: this is a different message on a
+            // different topic, and it is notification-service's dedup key.
+            assertThat(event.messageId()).isNotNull().isNotEqualTo(command.messageId());
+            assertThat(event.occurredAt()).isNotNull();
+        }
+
+        @Test
+        @DisplayName("CancelOrder publishes OrderCancelled with everything notification-service renders")
+        void cancelPublishesOrderCancelled() {
+            Order order = orderIn(OrderStatus.PENDING);
+            when(orderRepository.findById(order.getId())).thenReturn(Optional.of(order));
+            when(orderRepository.save(any(Order.class))).thenAnswer(inv -> inv.getArgument(0));
+
+            CancelOrderCommand command = cancel(order.getId());
+            orderService.cancelOrder(command);
+
+            ArgumentCaptor<OrderCancelledEvent> captor = ArgumentCaptor.forClass(OrderCancelledEvent.class);
+            verify(eventPublisher).publishOrderCancelled(captor.capture());
+            OrderCancelledEvent event = captor.getValue();
+
+            assertThat(event.sagaId()).isEqualTo(command.sagaId());
+            assertThat(event.orderId()).isEqualTo(order.getId());
+            assertThat(event.userId()).isEqualTo(USER_ID);
+            assertThat(event.item()).isEqualTo(ITEM);
+            assertThat(event.amount()).isEqualByComparingTo(EXPECTED_TOTAL);
+            assertThat(event.messageId()).isNotNull().isNotEqualTo(command.messageId());
+            assertThat(event.occurredAt()).isNotNull();
+        }
+
+        @Test
+        @DisplayName("the event carries the order total, not the unit price — it is what the customer is told")
+        void publishesDerivedTotalNotUnitPrice() {
+            Order order = orderIn(OrderStatus.PENDING);
+            when(orderRepository.findById(order.getId())).thenReturn(Optional.of(order));
+            when(orderRepository.save(any(Order.class))).thenAnswer(inv -> inv.getArgument(0));
+
+            orderService.confirmOrder(confirm(order.getId()));
+
+            ArgumentCaptor<OrderConfirmedEvent> captor = ArgumentCaptor.forClass(OrderConfirmedEvent.class);
+            verify(eventPublisher).publishOrderConfirmed(captor.capture());
+
+            assertThat(captor.getValue().amount())
+                    .isEqualByComparingTo(EXPECTED_TOTAL)
+                    .isNotEqualByComparingTo(UNIT_PRICE);
+        }
+
+        @Test
+        @DisplayName("the event carries the display description, never the SKU")
+        void publishesDisplayItemNotSku() {
+            Order order = orderIn(OrderStatus.PENDING);
+            when(orderRepository.findById(order.getId())).thenReturn(Optional.of(order));
+            when(orderRepository.save(any(Order.class))).thenAnswer(inv -> inv.getArgument(0));
+
+            orderService.cancelOrder(cancel(order.getId()));
+
+            ArgumentCaptor<OrderCancelledEvent> captor = ArgumentCaptor.forClass(OrderCancelledEvent.class);
+            verify(eventPublisher).publishOrderCancelled(captor.capture());
+
+            // "Your order for Mechanical keyboard ..." reads to a customer;
+            // "Your order for MECH-KB-01 ..." does not (ARCHITECTURE.md section 2.1).
+            assertThat(captor.getValue().item()).isEqualTo(ITEM).isNotEqualTo(ITEM_SKU);
         }
     }
 
@@ -216,7 +328,7 @@ class OrderServiceTest {
             Order order = orderIn(OrderStatus.CONFIRMED);
             when(orderRepository.findById(order.getId())).thenReturn(Optional.of(order));
 
-            CommandOutcome outcome = orderService.confirmOrder(order.getId(), UUID.randomUUID());
+            CommandOutcome outcome = orderService.confirmOrder(confirm(order.getId()));
 
             assertThat(outcome).isEqualTo(CommandOutcome.DUPLICATE_IGNORED);
             assertThat(order.getStatus()).isEqualTo(OrderStatus.CONFIRMED);
@@ -229,11 +341,65 @@ class OrderServiceTest {
             Order order = orderIn(OrderStatus.CANCELLED);
             when(orderRepository.findById(order.getId())).thenReturn(Optional.of(order));
 
-            CommandOutcome outcome = orderService.cancelOrder(order.getId(), UUID.randomUUID());
+            CommandOutcome outcome = orderService.cancelOrder(cancel(order.getId()));
 
             assertThat(outcome).isEqualTo(CommandOutcome.DUPLICATE_IGNORED);
             assertThat(order.getStatus()).isEqualTo(OrderStatus.CANCELLED);
             verify(orderRepository, never()).save(any(Order.class));
+        }
+
+        /**
+         * The one that protects the customer. Kafka redelivery is normal operation, and a
+         * re-published event would carry a fresh {@code messageId} — so it would slip past
+         * notification-service's own dedup and send a second message. Suppressing it has
+         * to happen here.
+         */
+        @Test
+        @DisplayName("a redelivered ConfirmOrder does not publish OrderConfirmed a second time")
+        void redeliveredConfirmDoesNotRepublish() {
+            Order order = orderIn(OrderStatus.PENDING);
+            when(orderRepository.findById(order.getId())).thenReturn(Optional.of(order));
+            when(orderRepository.save(any(Order.class))).thenAnswer(inv -> inv.getArgument(0));
+
+            ConfirmOrderCommand command = confirm(order.getId());
+
+            assertThat(orderService.confirmOrder(command)).isEqualTo(CommandOutcome.APPLIED);
+            // The exact same message again, as an at-least-once broker would redeliver it.
+            assertThat(orderService.confirmOrder(command)).isEqualTo(CommandOutcome.DUPLICATE_IGNORED);
+
+            verify(eventPublisher, times(1)).publishOrderConfirmed(any(OrderConfirmedEvent.class));
+        }
+
+        @Test
+        @DisplayName("a redelivered CancelOrder does not publish OrderCancelled a second time")
+        void redeliveredCancelDoesNotRepublish() {
+            Order order = orderIn(OrderStatus.PENDING);
+            when(orderRepository.findById(order.getId())).thenReturn(Optional.of(order));
+            when(orderRepository.save(any(Order.class))).thenAnswer(inv -> inv.getArgument(0));
+
+            CancelOrderCommand command = cancel(order.getId());
+
+            assertThat(orderService.cancelOrder(command)).isEqualTo(CommandOutcome.APPLIED);
+            assertThat(orderService.cancelOrder(command)).isEqualTo(CommandOutcome.DUPLICATE_IGNORED);
+
+            verify(eventPublisher, times(1)).publishOrderCancelled(any(OrderCancelledEvent.class));
+        }
+
+        /**
+         * A <em>different</em> command for the same already-terminal order, which is what a
+         * timeout sweep re-issuing {@code CancelOrder} looks like. The order's status is
+         * the idempotency key, not the message id, so this is suppressed too.
+         */
+        @Test
+        @DisplayName("a fresh command against an already-terminal order publishes nothing")
+        void freshCommandAgainstTerminalOrderPublishesNothing() {
+            Order order = orderIn(OrderStatus.CANCELLED);
+            when(orderRepository.findById(order.getId())).thenReturn(Optional.of(order));
+
+            assertThat(orderService.cancelOrder(cancel(order.getId())))
+                    .isEqualTo(CommandOutcome.DUPLICATE_IGNORED);
+
+            verify(eventPublisher, never()).publishOrderCancelled(any(OrderCancelledEvent.class));
         }
     }
 
@@ -242,29 +408,34 @@ class OrderServiceTest {
     class ConflictingCommandsAreRejected {
 
         @Test
-        @DisplayName("ConfirmOrder on a CANCELLED order leaves it CANCELLED")
+        @DisplayName("ConfirmOrder on a CANCELLED order leaves it CANCELLED and announces nothing")
         void confirmOnCancelledIsIgnored() {
             Order order = orderIn(OrderStatus.CANCELLED);
             when(orderRepository.findById(order.getId())).thenReturn(Optional.of(order));
 
-            CommandOutcome outcome = orderService.confirmOrder(order.getId(), UUID.randomUUID());
+            CommandOutcome outcome = orderService.confirmOrder(confirm(order.getId()));
 
             assertThat(outcome).isEqualTo(CommandOutcome.CONFLICT_IGNORED);
             assertThat(order.getStatus()).isEqualTo(OrderStatus.CANCELLED);
             verify(orderRepository, never()).save(any(Order.class));
+
+            // The customer was already told the order was cancelled. Telling them it is
+            // confirmed would be worse than the conflicting command itself.
+            verify(eventPublisher, never()).publishOrderConfirmed(any(OrderConfirmedEvent.class));
         }
 
         @Test
-        @DisplayName("CancelOrder on a CONFIRMED order leaves it CONFIRMED")
+        @DisplayName("CancelOrder on a CONFIRMED order leaves it CONFIRMED and announces nothing")
         void cancelOnConfirmedIsIgnored() {
             Order order = orderIn(OrderStatus.CONFIRMED);
             when(orderRepository.findById(order.getId())).thenReturn(Optional.of(order));
 
-            CommandOutcome outcome = orderService.cancelOrder(order.getId(), UUID.randomUUID());
+            CommandOutcome outcome = orderService.cancelOrder(cancel(order.getId()));
 
             assertThat(outcome).isEqualTo(CommandOutcome.CONFLICT_IGNORED);
             assertThat(order.getStatus()).isEqualTo(OrderStatus.CONFIRMED);
             verify(orderRepository, never()).save(any(Order.class));
+            verify(eventPublisher, never()).publishOrderCancelled(any(OrderCancelledEvent.class));
         }
     }
 
@@ -274,8 +445,12 @@ class OrderServiceTest {
         UUID unknownId = UUID.randomUUID();
         when(orderRepository.findById(unknownId)).thenReturn(Optional.empty());
 
-        assertThat(orderService.confirmOrder(unknownId, UUID.randomUUID()))
+        assertThat(orderService.confirmOrder(confirm(unknownId)))
                 .isEqualTo(CommandOutcome.ORDER_NOT_FOUND);
+
+        // Nothing to announce, and nothing to announce it *about* — the event's userId,
+        // item and amount all come from an order that does not exist.
+        verify(eventPublisher, never()).publishOrderConfirmed(any(OrderConfirmedEvent.class));
     }
 
     @Test
