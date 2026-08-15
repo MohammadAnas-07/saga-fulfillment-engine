@@ -1,3 +1,45 @@
 spring:
   application:
     name: saga-orchestrator
+
+  datasource:
+    # saga-orchestrator owns its own database. The sagas table is private to this
+    # service -- scheduler-service reads it through /internal/sagas/stuck, never directly.
+    url: ${SAGA_DB_URL:jdbc:postgresql://localhost:5432/saga_db}
+    username: ${SAGA_DB_USER:saga_orchestrator}
+    password: ${SAGA_DB_PASSWORD:saga_orchestrator}
+
+  jpa:
+    hibernate:
+      # Fine for a portfolio project. A real deployment would use Flyway/Liquibase
+      # migrations and set this to `validate`.
+      ddl-auto: update
+    open-in-view: false
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      properties:
+        spring.json.add.type.headers: false
+      acks: all
+    consumer:
+      group-id: ${SAGA_CONSUMER_GROUP:saga-orchestrator}
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+
+saga:
+  # How long a saga may stay non-terminal before the scheduler may compensate it.
+  # Stamped once at creation and never extended, so it bounds the whole saga.
+  # Set to something like PT10S to demo the timeout path without waiting.
+  timeout: ${SAGA_TIMEOUT:PT5M}
+  stuck-saga-batch-size: ${SAGA_STUCK_BATCH_SIZE:100}
+
+server:
+  port: ${SAGA_ORCHESTRATOR_PORT:8085}
+
+logging:
+  level:
+    com.mohammadanas.saga.orchestrator: INFO
