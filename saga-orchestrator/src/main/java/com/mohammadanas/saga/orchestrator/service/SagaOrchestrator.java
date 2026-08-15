@@ -1,6 +1,8 @@
 package com.mohammadanas.saga.orchestrator.service;
 
 import com.mohammadanas.saga.orchestrator.config.SagaProperties;
+import com.mohammadanas.saga.orchestrator.domain.ProcessedMessage;
+import com.mohammadanas.saga.orchestrator.domain.ProcessedMessageRepository;
 import com.mohammadanas.saga.orchestrator.domain.Saga;
 import com.mohammadanas.saga.orchestrator.domain.SagaRepository;
 import com.mohammadanas.saga.orchestrator.domain.SagaStatus;
@@ -24,18 +26,28 @@ import org.springframework.transaction.annotation.Transactional;
  * The saga state machine — the only component that decides what happens next
  * (ARCHITECTURE.md section 5.1).
  *
- * <p>Every handler follows the same shape: load the saga, check the transition is legal
- * from the current status, mutate, record a step, publish. Illegal transitions are
- * rejected rather than applied, which is what stops a late or duplicated reply from
- * resurrecting a finished saga.
+ * <p>Every handler follows the same shape: reject a message already handled, load the
+ * saga, check the transition is legal from the current status, mutate, record a step,
+ * publish. Illegal transitions are rejected rather than applied, which is what stops a
+ * late reply from resurrecting a finished saga; the dedup check in front of it is what
+ * stops a redelivered one from advancing the machine twice (§6).
  */
 @Service
 public class SagaOrchestrator {
+
+    private static final String ORDER_CREATED = "OrderCreated";
+    private static final String INVENTORY_RESERVED = "InventoryReserved";
+    private static final String INVENTORY_RESERVATION_FAILED = "InventoryReservationFailed";
+    private static final String INVENTORY_RELEASED = "InventoryReleased";
+    private static final String PAYMENT_COMPLETED = "PaymentCompleted";
+    private static final String PAYMENT_FAILED = "PaymentFailed";
+    private static final String PAYMENT_REFUNDED = "PaymentRefunded";
 
     private static final Logger log = LoggerFactory.getLogger(SagaOrchestrator.class);
 
     private final SagaRepository sagaRepository;
     private final SagaStepRepository sagaStepRepository;
+    private final ProcessedMessageRepository processedMessageRepository;
     private final SagaCommandPublisher publisher;
     private final SagaProperties properties;
     private final Clock clock;
@@ -43,11 +55,13 @@ public class SagaOrchestrator {
     public SagaOrchestrator(
             SagaRepository sagaRepository,
             SagaStepRepository sagaStepRepository,
+            ProcessedMessageRepository processedMessageRepository,
             SagaCommandPublisher publisher,
             SagaProperties properties,
             Clock clock) {
         this.sagaRepository = sagaRepository;
         this.sagaStepRepository = sagaStepRepository;
+        this.processedMessageRepository = processedMessageRepository;
         this.publisher = publisher;
         this.properties = properties;
         this.clock = clock;
@@ -56,19 +70,29 @@ public class SagaOrchestrator {
     /** Starts a saga and issues the first command. */
     @Transactional
     public SagaOutcome onOrderCreated(InboundEvents.OrderCreated event) {
+        if (alreadyProcessed(event.messageId(), ORDER_CREATED)) {
+            return SagaOutcome.IGNORED_REDELIVERY;
+        }
+
+        // Kept alongside the dedup check rather than replaced by it. They catch different
+        // things: this catches a *second* OrderCreated for the same order, which is a
+        // different message with a different id, not a redelivery of this one.
         Optional<Saga> existing = sagaRepository.findByOrderId(event.orderId());
         if (existing.isPresent()) {
             log.info("Ignoring OrderCreated for order {}: saga {} already exists",
                     event.orderId(), existing.get().getId());
+            markProcessed(event.messageId(), ORDER_CREATED);
             return SagaOutcome.IGNORED_DUPLICATE;
         }
+
+        markProcessed(event.messageId(), ORDER_CREATED);
 
         Instant deadline = Instant.now(clock).plus(properties.getTimeout());
         Saga saga = sagaRepository.save(Saga.start(
                 event.orderId(), event.userId(), event.itemSku(), event.item(),
                 event.quantity(), event.amount(), deadline));
 
-        record(saga, SagaStep.inbound(saga.getId(), "OrderCreated", "order " + event.orderId()));
+        record(saga, SagaStep.inbound(saga.getId(), ORDER_CREATED, "order " + event.orderId()));
 
         publisher.reserveInventory(new OutboundMessages.ReserveInventory(
                 UUID.randomUUID(), saga.getId(), saga.getOrderId(), saga.getItemSku(), saga.getQuantity()));
@@ -83,15 +107,20 @@ public class SagaOrchestrator {
     /** Inventory is held; charge the customer. */
     @Transactional
     public SagaOutcome onInventoryReserved(InboundEvents.InventoryReserved event) {
+        if (alreadyProcessed(event.messageId(), INVENTORY_RESERVED)) {
+            return SagaOutcome.IGNORED_REDELIVERY;
+        }
         Saga saga = load(event.sagaId());
         if (saga == null) {
             return SagaOutcome.UNKNOWN_SAGA;
         }
+        markProcessed(event.messageId(), INVENTORY_RESERVED);
+
         if (saga.getStatus() != SagaStatus.AWAITING_INVENTORY) {
-            return rejectLateReply(saga, "InventoryReserved");
+            return rejectLateReply(saga, INVENTORY_RESERVED);
         }
 
-        record(saga, SagaStep.inbound(saga.getId(), "InventoryReserved", event.item() + " x" + event.quantity()));
+        record(saga, SagaStep.inbound(saga.getId(), INVENTORY_RESERVED, event.item() + " x" + event.quantity()));
 
         publisher.processPayment(new OutboundMessages.ProcessPayment(
                 UUID.randomUUID(), saga.getId(), saga.getOrderId(), saga.getUserId(), saga.getAmount()));
@@ -108,15 +137,20 @@ public class SagaOrchestrator {
      */
     @Transactional
     public SagaOutcome onInventoryReservationFailed(InboundEvents.InventoryReservationFailed event) {
+        if (alreadyProcessed(event.messageId(), INVENTORY_RESERVATION_FAILED)) {
+            return SagaOutcome.IGNORED_REDELIVERY;
+        }
         Saga saga = load(event.sagaId());
         if (saga == null) {
             return SagaOutcome.UNKNOWN_SAGA;
         }
+        markProcessed(event.messageId(), INVENTORY_RESERVATION_FAILED);
+
         if (saga.getStatus() != SagaStatus.AWAITING_INVENTORY) {
-            return rejectLateReply(saga, "InventoryReservationFailed");
+            return rejectLateReply(saga, INVENTORY_RESERVATION_FAILED);
         }
 
-        record(saga, SagaStep.inbound(saga.getId(), "InventoryReservationFailed", event.reason()));
+        record(saga, SagaStep.inbound(saga.getId(), INVENTORY_RESERVATION_FAILED, event.reason()));
 
         cancelOrder(saga, "reservation failed: " + event.reason());
         transition(saga, SagaStatus.CANCELLED);
@@ -126,15 +160,20 @@ public class SagaOrchestrator {
     /** Payment succeeded; confirm the order and tell the customer. */
     @Transactional
     public SagaOutcome onPaymentCompleted(InboundEvents.PaymentCompleted event) {
+        if (alreadyProcessed(event.messageId(), PAYMENT_COMPLETED)) {
+            return SagaOutcome.IGNORED_REDELIVERY;
+        }
         Saga saga = load(event.sagaId());
         if (saga == null) {
             return SagaOutcome.UNKNOWN_SAGA;
         }
+        markProcessed(event.messageId(), PAYMENT_COMPLETED);
+
         if (saga.getStatus() != SagaStatus.AWAITING_PAYMENT) {
-            return rejectLateReply(saga, "PaymentCompleted");
+            return rejectLateReply(saga, PAYMENT_COMPLETED);
         }
 
-        record(saga, SagaStep.inbound(saga.getId(), "PaymentCompleted", "payment " + event.paymentId()));
+        record(saga, SagaStep.inbound(saga.getId(), PAYMENT_COMPLETED, "payment " + event.paymentId()));
 
         // The command only. Announcing OrderConfirmed is order-service's job, since it owns
         // the aggregate the fact is about (§3.1).
@@ -157,15 +196,20 @@ public class SagaOrchestrator {
      */
     @Transactional
     public SagaOutcome onPaymentFailed(InboundEvents.PaymentFailed event) {
+        if (alreadyProcessed(event.messageId(), PAYMENT_FAILED)) {
+            return SagaOutcome.IGNORED_REDELIVERY;
+        }
         Saga saga = load(event.sagaId());
         if (saga == null) {
             return SagaOutcome.UNKNOWN_SAGA;
         }
+        markProcessed(event.messageId(), PAYMENT_FAILED);
+
         if (saga.getStatus() != SagaStatus.AWAITING_PAYMENT) {
-            return rejectLateReply(saga, "PaymentFailed");
+            return rejectLateReply(saga, PAYMENT_FAILED);
         }
 
-        record(saga, SagaStep.inbound(saga.getId(), "PaymentFailed", event.reason()));
+        record(saga, SagaStep.inbound(saga.getId(), PAYMENT_FAILED, event.reason()));
         transition(saga, SagaStatus.COMPENSATING);
 
         publisher.releaseInventory(new OutboundMessages.ReleaseInventory(
@@ -190,30 +234,40 @@ public class SagaOrchestrator {
      */
     @Transactional
     public SagaOutcome onInventoryReleased(InboundEvents.InventoryReleased event) {
+        if (alreadyProcessed(event.messageId(), INVENTORY_RELEASED)) {
+            return SagaOutcome.IGNORED_REDELIVERY;
+        }
         Saga saga = load(event.sagaId());
         if (saga == null) {
             return SagaOutcome.UNKNOWN_SAGA;
         }
+        markProcessed(event.messageId(), INVENTORY_RELEASED);
+
         if (saga.getStatus() != SagaStatus.COMPENSATING) {
-            return rejectLateReply(saga, "InventoryReleased");
+            return rejectLateReply(saga, INVENTORY_RELEASED);
         }
 
-        record(saga, SagaStep.inbound(saga.getId(), "InventoryReleased", event.outcome()));
+        record(saga, SagaStep.inbound(saga.getId(), INVENTORY_RELEASED, event.outcome()));
         saga.inventoryReleaseConfirmed();
         return finishCompensationIfComplete(saga);
     }
 
     @Transactional
     public SagaOutcome onPaymentRefunded(InboundEvents.PaymentRefunded event) {
+        if (alreadyProcessed(event.messageId(), PAYMENT_REFUNDED)) {
+            return SagaOutcome.IGNORED_REDELIVERY;
+        }
         Saga saga = load(event.sagaId());
         if (saga == null) {
             return SagaOutcome.UNKNOWN_SAGA;
         }
+        markProcessed(event.messageId(), PAYMENT_REFUNDED);
+
         if (saga.getStatus() != SagaStatus.COMPENSATING) {
-            return rejectLateReply(saga, "PaymentRefunded");
+            return rejectLateReply(saga, PAYMENT_REFUNDED);
         }
 
-        record(saga, SagaStep.inbound(saga.getId(), "PaymentRefunded", event.outcome()));
+        record(saga, SagaStep.inbound(saga.getId(), PAYMENT_REFUNDED, event.outcome()));
         saga.paymentRefundConfirmed();
         return finishCompensationIfComplete(saga);
     }
@@ -260,6 +314,41 @@ public class SagaOrchestrator {
         publisher.cancelOrder(new OutboundMessages.CancelOrder(
                 UUID.randomUUID(), saga.getId(), saga.getOrderId()));
         record(saga, SagaStep.outbound(saga.getId(), "CancelOrder", reason));
+    }
+
+    /**
+     * Fast path for a plain redelivery (§6).
+     *
+     * <p>As in inventory-service and payment-service, this lookup is only the fast path.
+     * The primary key on {@code processed_messages} remains the actual guarantee: two
+     * genuinely concurrent deliveries can both pass this check, and the second insert then
+     * fails, rolling that transaction back so the machine advances once.
+     */
+    private boolean alreadyProcessed(UUID messageId, String eventType) {
+        if (processedMessageRepository.existsById(messageId)) {
+            log.info("Ignoring redelivered {} (messageId={}): already processed", eventType, messageId);
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Marks the message handled, in the same transaction as whatever the handler goes on to
+     * do.
+     *
+     * <p>Called <em>after</em> the saga is known to exist, which is deliberate: an
+     * {@code UNKNOWN_SAGA} reply is not marked, so it stays eligible for redelivery. The
+     * alternative would permanently swallow a reply whose saga was merely not visible yet,
+     * and there is nothing to gain by it — an unknown saga changes no state, so replaying
+     * it costs a log line.
+     *
+     * <p>A reply that <em>is</em> marked and then rejected by the transition guard is still
+     * marked, and should be: it was handled, the answer was "no". Leaving it unmarked would
+     * append a fresh {@code (ignored)} step to the saga history on every redelivery, which
+     * would make an append-only audit trail noisier the flakier the broker got.
+     */
+    private void markProcessed(UUID messageId, String eventType) {
+        processedMessageRepository.save(new ProcessedMessage(messageId, eventType));
     }
 
     private Saga load(UUID sagaId) {
