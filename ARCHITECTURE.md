@@ -6,7 +6,18 @@ scheduler that drives timeout-based compensation for sagas that stall.
 This document is the design reference for the project. It is updated in the same commit
 as any change that affects design.
 
-**Status:** Chunk 0 (architecture + scaffolding). No business logic implemented yet.
+**Status:** Chunks 0–5.5 complete. **The system is connected end to end**: an order created
+over REST drives the full saga through inventory and payment and back, and the terminal
+outcome reaches the customer as a notification. Every topic in §5.3 now has both a producer
+and a consumer. What remains is hardening and operability — orchestrator-side dedup
+(Chunk 6), the timeout sweep (Chunk 7), the integration suite (Chunk 8), and a local run
+setup (Chunk 9).
+
+> **"End to end" here means every link is implemented and unit-tested, not that the whole
+> chain has been observed running.** The Testcontainers suites that would prove that have
+> still never executed on the development machine (Docker is unreachable — see README);
+> the cross-service seam closed in Chunk 5.5 was verified directly instead, in the way that
+> chunk records. Chunk 8 is where "observed running" gets earned.
 
 ---
 
@@ -61,7 +72,7 @@ This is a **portfolio / learning project**. It exists to demonstrate, in working
 
 | Service | Responsibility |
 | --- | --- |
-| **order-service** | Owns the `Order` aggregate and its lifecycle (`PENDING` → `CONFIRMED`/`CANCELLED`). Exposes the client-facing REST API for creating and reading orders. Publishes `OrderCreated`. Consumes `ConfirmOrder` / `CancelOrder` commands and applies the resulting status change. Source of truth for order data — **not** for saga state. |
+| **order-service** | Owns the `Order` aggregate and its lifecycle (`PENDING` → `CONFIRMED`/`CANCELLED`). Exposes the client-facing REST API for creating and reading orders. Publishes `OrderCreated`. Consumes `ConfirmOrder` / `CancelOrder` commands, applies the resulting status change, and announces it as `OrderConfirmed` / `OrderCancelled` — the terminal-state events notification-service consumes (§3.1). Source of truth for order data — **not** for saga state. |
 | **inventory-service** | Owns stock levels and reservations. Consumes `ReserveInventory`, attempts to reserve, and reports `InventoryReserved` or `InventoryReservationFailed`. Consumes `ReleaseInventory` as the compensating action and reports `InventoryReleased`. Must be idempotent (§6). |
 | **payment-service** | Owns payment records. Consumes `ProcessPayment` and reports `PaymentCompleted` or `PaymentFailed`. Payment outcome is **simulated** (§1 non-goals). Must be idempotent (§6) — this is where double-processing is most costly. |
 | **notification-service** | Terminal-state side effects only. Consumes `OrderConfirmed` / `OrderCancelled` and emits a customer notification (logged/stubbed). Deliberately has no compensating action — a sent notification cannot be un-sent, which is why it runs only on terminal states. |
@@ -163,6 +174,11 @@ decision-maker at every branch.
 > their order was confirmed or cancelled, and order-service knowing its own order reached
 > that status is entirely sufficient for that message. "The saga is complete" is a fact
 > about the saga, not about the notification.
+>
+> **Implemented in Chunk 5.5**, and the implementation reinforced the argument: the event
+> needs `userId`, `item` and `amount`, which live on the order aggregate. The orchestrator
+> would have had to carry that data around to publish these, or ask for it — order-service
+> simply reads its own row.
 
 ### 3.2 Failure path A — inventory reservation fails
 
@@ -381,20 +397,29 @@ of being an emergent property of who happens to subscribe to what.
 | `payment.events.payment-completed.v1` | payment-service |
 | `payment.events.payment-failed.v1` | payment-service |
 | `payment.events.payment-refunded.v1` | payment-service (compensation confirmation) |
-| `order.events.order-confirmed.v1` | order-service — **no producer yet**, see below |
-| `order.events.order-cancelled.v1` | order-service — **no producer yet**, see below |
+| `order.events.order-confirmed.v1` | order-service |
+| `order.events.order-cancelled.v1` | order-service |
 
-> **The two terminal-state order topics still have no producer as of Chunk 5.**
-> order-service publishes only `OrderCreated`; it consumes `ConfirmOrder` / `CancelOrder`
-> and applies the status change silently. `notification-service` is therefore a complete
-> consumer with nothing feeding it, and its `OrderConfirmedEvent` /
-> `OrderCancelledEvent` records remain a contract **authored** by Chunk 4 rather than one
-> confirmed against a producer.
+> **The two terminal-state order topics had no producer until Chunk 5.5, and now do.**
+> order-service published only `OrderCreated`; it consumed `ConfirmOrder` / `CancelOrder`
+> and applied the status change *silently*, so `notification-service` was a complete
+> consumer with nothing feeding it and its `OrderConfirmedEvent` / `OrderCancelledEvent`
+> records were a contract **authored** by Chunk 4 rather than one confirmed against a
+> producer.
 >
-> Closing this needs **order-service** to publish both events when it applies a terminal
-> status — §3.1 explains why it and not the orchestrator. Deliberately left to its own
-> chunk rather than folded into the orchestrator, where it would have been quick but
-> wrong. Until then the end-to-end path stops at the order status change.
+> Chunk 5.5 closed that: order-service publishes both events when it applies a terminal
+> status — §3.1 explains why it and not the orchestrator — and every topic in this section
+> now has a producer and a consumer. The contract was matched to notification-service's
+> existing records field for field rather than re-derived, since both sides were built
+> independently; `TerminalEventContractTest` in order-service pins the field names, and is
+> the mirror of the orchestrator's `OutboundContractTest`.
+>
+> **What the two records could not take from the command.** `ConfirmOrder` and
+> `CancelOrder` carry only `messageId`, `sagaId` and `orderId`, while
+> notification-service needs `userId`, `item` and `amount` to write a customer message.
+> Those come from the order aggregate, which order-service owns — so the producing service
+> had to be the one that already holds the data, which is the same conclusion §3.1 reaches
+> from the ownership argument. `sagaId` can only come from the command.
 
 ### 5.3.1 Compensation confirmations are unconditional
 
@@ -507,6 +532,17 @@ rather than errors:
 | `DUPLICATE_IGNORED` | Order already holds the requested status — plain redelivery. |
 | `CONFLICT_IGNORED` | Order is terminal in the *other* status. A terminal order never flips. |
 | `ORDER_NOT_FOUND` | No such order. Ignored rather than thrown, so the consumer cannot spin on a poison message. |
+
+**None of the three publishes a terminal-state event.** Since Chunk 5.5 the status change
+and its `OrderConfirmed` / `OrderCancelled` announcement happen together in one
+transaction, on the `APPLIED` path and nowhere else — the same "a duplicate does not
+re-publish" rule §5.3.1 states for the compensation confirmations.
+
+That suppression has to live **here**, and cannot be delegated downstream.
+notification-service dedups on `messageId`, but a re-published event would carry a *fresh*
+one — it is a new message announcing an old fact — so it would pass that guard cleanly and
+the customer would be told twice. A sent notification cannot be un-sent (§2). The order's
+`status` column is what actually protects them.
 
 > **Implementation happens in a later chunk** for the other services. This section records
 > the requirement so it is not rediscovered late.
@@ -658,9 +694,10 @@ Update after every chunk.
       Eureka (none exists in this project — see §1 non-goals), **plus its own
       `processed_messages` dedup**, which matters more here than anywhere else because a
       sent notification cannot be un-sent. *Branch: `feature/notification-service`.*
-      **Blocked end to end:** neither topic has a producer yet (§5.3). order-service must
-      publish both when it applies a terminal status before this service does anything in
-      a running system. Its event records are a contract authored here, not confirmed.
+      **~~Blocked end to end~~ — unblocked by Chunk 5.5**, which gave both topics their
+      producer. The event records authored here were the contract order-service was
+      matched to, unchanged; they are now confirmed against a real producer rather than
+      merely asserted.
       **Caveat:** as with Chunks 1–3, the Testcontainers integration tests are written but
       have never executed — Docker is unreachable from the dev machine (see README).
 - [x] **Chunk 5 — saga-orchestrator.** `Saga` entity with a configurable timeout deadline,
@@ -678,6 +715,36 @@ Update after every chunk.
       rejects replies invalid from the current status, which covers the common duplicate,
       but it is not a substitute for a `processed_messages` table.
       **No Testcontainers suite** for this module — deliberately, see Chunk 8.
+- [x] **Chunk 5.5 — order-service terminal-state events. The system is now connected end
+      to end.** order-service publishes `OrderConfirmed` when it applies `ConfirmOrder` and
+      `OrderCancelled` when it applies `CancelOrder`, closing the one gap that left
+      notification-service a finished consumer with no producer (§5.3). *Branch:
+      `feature/order-service-terminal-events`.*
+      **Numbered 5.5 rather than 6** because "Chunk 6" is referenced by name from Chunks 2
+      and 3 and from §6 as the idempotency work; renumbering would have invalidated those
+      references to save nothing. The insertion point is where the work actually belongs in
+      sequence — after the orchestrator existed to issue the commands.
+      **The contract was matched, not designed.** Both sides were built independently, so
+      the two new records copy notification-service's `OrderConfirmedEvent` /
+      `OrderCancelledEvent` field for field. `TerminalEventContractTest` pins those names,
+      the same job the orchestrator's `OutboundContractTest` does — a renamed field on a
+      wire with type headers off does not fail to compile, it arrives as `null` and a
+      customer is told "Your order for null (null) is confirmed."
+      **`sagaId` comes from the command; `userId`, `item` and `amount` come from the
+      order.** The commands carry no order detail, so the publishing service had to be the
+      one holding the aggregate (§3.1, §5.3).
+      **Idempotency:** publishing happens on the `APPLIED` path only, so a redelivered or
+      conflicting command changes nothing and announces nothing (§6.1 explains why
+      notification-service's own dedup cannot cover this case).
+      **Verified without Docker.** Testcontainers still cannot start here, so the
+      cross-service seam was checked directly instead: order-service's real
+      `JsonSerializer` (type headers off, as configured) was used to serialize both events,
+      and notification-service's real `StringJsonMessageConverter` to deserialize them into
+      *its* records and render the customer messages — both modules' compiled classes, no
+      shared code, every field surviving and both messages rendering clean. That covers the
+      payload contract, which was the actual risk. It does **not** cover the broker path
+      itself — partition keys, offsets, listener wiring — which the integration tests
+      written here cover and which stay unrun until Chunk 8.
 - [ ] **Chunk 6 — idempotency (orchestrator only).** Dedup on the orchestrator's reply
       side (§6): a duplicated `PaymentCompleted` must not drive a second `OrderConfirmed`.
       inventory-service's landed in Chunk 2 and payment-service's in Chunk 3, so this is

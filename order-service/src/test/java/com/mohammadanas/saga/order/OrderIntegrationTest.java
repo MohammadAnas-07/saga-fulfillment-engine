@@ -11,11 +11,14 @@ import com.mohammadanas.saga.order.domain.OrderRepository;
 import com.mohammadanas.saga.order.domain.OrderStatus;
 import com.mohammadanas.saga.order.messaging.CancelOrderCommand;
 import com.mohammadanas.saga.order.messaging.ConfirmOrderCommand;
+import com.mohammadanas.saga.order.messaging.OrderCancelledEvent;
+import com.mohammadanas.saga.order.messaging.OrderConfirmedEvent;
 import com.mohammadanas.saga.order.messaging.OrderCreatedEvent;
 import com.mohammadanas.saga.order.messaging.OrderTopics;
 import java.math.BigDecimal;
 import java.time.Duration;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import org.apache.kafka.clients.consumer.Consumer;
@@ -75,6 +78,13 @@ class OrderIntegrationTest {
 
     private static Consumer<String, String> orderCreatedConsumer;
 
+    /**
+     * Subscribed to both terminal-state topics — the ones notification-service consumes.
+     * Kept separate from the {@code OrderCreated} consumer so a test can drain one without
+     * swallowing the other's records.
+     */
+    private static Consumer<String, String> terminalEventConsumer;
+
     @Autowired
     private TestRestTemplate restTemplate;
 
@@ -115,20 +125,30 @@ class OrderIntegrationTest {
 
     @BeforeAll
     static void startConsumer() {
+        orderCreatedConsumer = consumerFor("order-created-test-consumer", OrderTopics.ORDER_CREATED);
+        terminalEventConsumer = consumerFor("terminal-events-test-consumer",
+                OrderTopics.ORDER_CONFIRMED, OrderTopics.ORDER_CANCELLED);
+    }
+
+    private static Consumer<String, String> consumerFor(String groupId, String... topics) {
         Map<String, Object> props = new HashMap<>(
-                KafkaTestUtils.consumerProps(KAFKA.getBootstrapServers(), "order-created-test-consumer", "true"));
+                KafkaTestUtils.consumerProps(KAFKA.getBootstrapServers(), groupId, "true"));
         props.put("key.deserializer", StringDeserializer.class);
         props.put("value.deserializer", StringDeserializer.class);
         props.put("auto.offset.reset", "earliest");
 
-        orderCreatedConsumer = new org.apache.kafka.clients.consumer.KafkaConsumer<>(props);
-        orderCreatedConsumer.subscribe(java.util.List.of(OrderTopics.ORDER_CREATED));
+        Consumer<String, String> consumer = new org.apache.kafka.clients.consumer.KafkaConsumer<>(props);
+        consumer.subscribe(java.util.List.of(topics));
+        return consumer;
     }
 
     @AfterAll
     static void stopConsumer() {
         if (orderCreatedConsumer != null) {
             orderCreatedConsumer.close();
+        }
+        if (terminalEventConsumer != null) {
+            terminalEventConsumer.close();
         }
     }
 
@@ -251,6 +271,109 @@ class OrderIntegrationTest {
         awaitStatus(followUp.getId(), OrderStatus.CONFIRMED);
         assertThat(orderRepository.findById(saved.getId()).orElseThrow().getStatus())
                 .isEqualTo(OrderStatus.CONFIRMED);
+    }
+
+    @Test
+    @DisplayName("ConfirmOrder publishes OrderConfirmed to the wire, keyed by saga id, "
+            + "with the payload notification-service consumes")
+    void confirmOrderPublishesOrderConfirmed() throws Exception {
+        Order saved = orderRepository.save(
+                Order.create("user-11", "MECH-KB-01", "Mechanical keyboard", 2, new BigDecimal("49.99")));
+        UUID sagaId = UUID.randomUUID();
+
+        kafkaTemplate.send(OrderTopics.CONFIRM_ORDER, saved.getId().toString(),
+                new ConfirmOrderCommand(UUID.randomUUID(), sagaId, saved.getId()));
+
+        awaitStatus(saved.getId(), OrderStatus.CONFIRMED);
+
+        List<ConsumerRecord<String, String>> published =
+                collect(OrderTopics.ORDER_CONFIRMED, saved.getId());
+        assertThat(published).hasSize(1);
+
+        // Keyed by saga id, so this and every other message in the saga share a partition
+        // (ARCHITECTURE.md section 5.4).
+        assertThat(published.get(0).key()).isEqualTo(sagaId.toString());
+
+        // Deserialized against order-service's record here; the field names it shares with
+        // notification-service's record are pinned by TerminalEventContractTest.
+        OrderConfirmedEvent event =
+                objectMapper.readValue(published.get(0).value(), OrderConfirmedEvent.class);
+        assertThat(event.sagaId()).isEqualTo(sagaId);
+        assertThat(event.orderId()).isEqualTo(saved.getId());
+        assertThat(event.userId()).isEqualTo("user-11");
+        assertThat(event.item()).isEqualTo("Mechanical keyboard");
+        assertThat(event.amount()).isEqualByComparingTo(new BigDecimal("99.98"));
+        assertThat(event.messageId()).isNotNull();
+        assertThat(event.occurredAt()).isNotNull();
+    }
+
+    @Test
+    @DisplayName("CancelOrder publishes OrderCancelled to the wire")
+    void cancelOrderPublishesOrderCancelled() throws Exception {
+        Order saved = orderRepository.save(
+                Order.create("user-12", "USB-HUB-01", "USB hub", 1, new BigDecimal("25.50")));
+        UUID sagaId = UUID.randomUUID();
+
+        kafkaTemplate.send(OrderTopics.CANCEL_ORDER, saved.getId().toString(),
+                new CancelOrderCommand(UUID.randomUUID(), sagaId, saved.getId()));
+
+        awaitStatus(saved.getId(), OrderStatus.CANCELLED);
+
+        List<ConsumerRecord<String, String>> published =
+                collect(OrderTopics.ORDER_CANCELLED, saved.getId());
+        assertThat(published).hasSize(1);
+        assertThat(published.get(0).key()).isEqualTo(sagaId.toString());
+
+        OrderCancelledEvent event =
+                objectMapper.readValue(published.get(0).value(), OrderCancelledEvent.class);
+        assertThat(event.sagaId()).isEqualTo(sagaId);
+        assertThat(event.orderId()).isEqualTo(saved.getId());
+        assertThat(event.userId()).isEqualTo("user-12");
+        assertThat(event.item()).isEqualTo("USB hub");
+        assertThat(event.amount()).isEqualByComparingTo(new BigDecimal("25.50"));
+    }
+
+    @Test
+    @DisplayName("a redelivered ConfirmOrder publishes OrderConfirmed exactly once, "
+            + "so the customer is not notified twice")
+    void redeliveredConfirmOrderPublishesOnce() {
+        Order saved = orderRepository.save(
+                Order.create("user-13", "LAMP-01", "Desk lamp", 1, new BigDecimal("30.00")));
+
+        ConfirmOrderCommand command =
+                new ConfirmOrderCommand(UUID.randomUUID(), UUID.randomUUID(), saved.getId());
+
+        kafkaTemplate.send(OrderTopics.CONFIRM_ORDER, saved.getId().toString(), command);
+        awaitStatus(saved.getId(), OrderStatus.CONFIRMED);
+
+        // The exact same message again, as an at-least-once broker would redeliver it.
+        kafkaTemplate.send(OrderTopics.CONFIRM_ORDER, saved.getId().toString(), command);
+
+        // One event, not two. A second would carry a *fresh* messageId and therefore slip
+        // past notification-service's own dedup — this is where it has to be stopped.
+        assertThat(collect(OrderTopics.ORDER_CONFIRMED, saved.getId())).hasSize(1);
+    }
+
+    /**
+     * Drains the terminal-event topics for the full window and returns every record on
+     * {@code topic} for {@code orderId}.
+     *
+     * <p>Polls the whole window rather than returning on the first match, deliberately:
+     * the duplicate-suppression test is asserting the <em>absence</em> of a second event,
+     * and an early return could discard it and pass for the wrong reason.
+     */
+    private List<ConsumerRecord<String, String>> collect(String topic, UUID orderId) {
+        List<ConsumerRecord<String, String>> matches = new java.util.ArrayList<>();
+        long deadline = System.currentTimeMillis() + Duration.ofSeconds(20).toMillis();
+
+        while (System.currentTimeMillis() < deadline) {
+            for (ConsumerRecord<String, String> record : terminalEventConsumer.poll(Duration.ofMillis(500))) {
+                if (record.topic().equals(topic) && record.value().contains(orderId.toString())) {
+                    matches.add(record);
+                }
+            }
+        }
+        return matches;
     }
 
     private void awaitStatus(UUID orderId, OrderStatus expected) {
