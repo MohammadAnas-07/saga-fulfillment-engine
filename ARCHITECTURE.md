@@ -150,12 +150,19 @@ decision-maker at every branch.
    **`OrderConfirmed`** event; **notification-service** consumes it and notifies the
    customer. Saga is terminal.
 
-> **Corrected in Chunk 4.** Step 7 previously said the *orchestrator* publishes
-> `OrderConfirmed`, which contradicted §5.3's listing of both terminal-state topics as
-> order-service-produced. The listing is right and the step was loose: an order reaching
-> `CONFIRMED` is a fact about the order aggregate, and §5.1 has events published by the
-> service that owns the data. The orchestrator issues the *command*; order-service
-> announces the *fact*. The same correction applies to the cancellation paths below.
+> **Corrected in Chunk 4, and reaffirmed in Chunk 5.** Step 7 previously said the
+> *orchestrator* publishes `OrderConfirmed`, which contradicted §5.3's listing of both
+> terminal-state topics as order-service-produced. The listing is right and the step was
+> loose: an order reaching `CONFIRMED` is a fact about the order aggregate, and §5.1 has
+> events published by the service that owns the data. The orchestrator issues the
+> *command*; order-service announces the *fact*. The same correction applies to the
+> cancellation paths below.
+>
+> Chunk 5 briefly moved these back to the orchestrator on the argument that only it knows
+> a saga has *finished*. That was reverted: notification-service is telling a customer
+> their order was confirmed or cancelled, and order-service knowing its own order reached
+> that status is entirely sufficient for that message. "The saga is complete" is a fact
+> about the saga, not about the notification.
 
 ### 3.2 Failure path A — inventory reservation fails
 
@@ -234,17 +241,37 @@ arrive for a saga that never paid at all (a no-op, not an error).
 ```mermaid
 stateDiagram-v2
     [*] --> STARTED : OrderCreated
-    STARTED --> CANCELLED : InventoryReservationFailed
-    STARTED --> CONFIRMED : PaymentCompleted
-    STARTED --> COMPENSATING : PaymentFailed
-    STARTED --> COMPENSATING : timeout (scheduler)
-    COMPENSATING --> CANCELLED : InventoryReleased
+    STARTED --> AWAITING_INVENTORY : ReserveInventory issued
+    AWAITING_INVENTORY --> CANCELLED : InventoryReservationFailed
+    AWAITING_INVENTORY --> AWAITING_PAYMENT : InventoryReserved
+    AWAITING_PAYMENT --> CONFIRMED : PaymentCompleted
+    AWAITING_PAYMENT --> COMPENSATING : PaymentFailed
+    AWAITING_INVENTORY --> COMPENSATING : timeout (scheduler)
+    AWAITING_PAYMENT --> COMPENSATING : timeout (scheduler)
+    COMPENSATING --> COMPENSATING : one undo confirmed, others outstanding
+    COMPENSATING --> CANCELLED : all undos confirmed
     CONFIRMED --> [*]
     CANCELLED --> [*]
 ```
 
-`CONFIRMED` and `CANCELLED` are terminal. `STARTED` and `COMPENSATING` are non-terminal
-and therefore eligible for timeout sweeping.
+`CONFIRMED` and `CANCELLED` are terminal. `STARTED`, `AWAITING_INVENTORY`,
+`AWAITING_PAYMENT` and `COMPENSATING` are non-terminal and therefore eligible for timeout
+sweeping.
+
+The `AWAITING_*` states were added in Chunk 5. Without them a stalled saga cannot say
+*what* it is stalled on, and the sweep cannot tell an unanswered reservation from an
+unanswered payment — which matters because those two need different compensation
+(§3.5): the first has nothing to undo, the second may have money to return.
+
+**Which compensating commands a timeout issues depends on where the saga stalled:**
+
+| Stalled in | Undo required |
+| --- | --- |
+| `AWAITING_INVENTORY` | Possibly `ReleaseInventory` — the reservation may or may not have happened. Issued unconditionally; the confirmation is unconditional too (§5.3.1). |
+| `AWAITING_PAYMENT` | `ReleaseInventory` **and** `RefundPayment` — stock is definitely held, and the payment may have succeeded with its reply lost (§3.5). |
+
+The self-loop is the partial-compensation case: the saga stays in `COMPENSATING` while any
+dispatched undo is still unconfirmed.
 
 ---
 
@@ -257,7 +284,28 @@ inventory stays reserved.
 **scheduler-service** runs on a fixed interval and:
 
 1. **Queries `saga-orchestrator`** for sagas whose **timeout deadline has passed** and
-   whose status is still **non-terminal** (`STARTED` or `COMPENSATING`).
+   whose status is still **non-terminal** (`STARTED`, `AWAITING_INVENTORY`,
+   `AWAITING_PAYMENT` or `COMPENSATING`).
+
+   This is a **REST call** — `GET /internal/sagas/stuck` — not a direct read of the
+   orchestrator's tables, and it is the one deliberate exception to §1's "no synchronous
+   inter-service calls" rule. The reasoning, in full, because the exception is worth
+   justifying:
+
+   - **Why not read the database?** Each service owns its own schema (§7). A scheduler
+     querying `sagas` directly would couple its deploys to the orchestrator's table layout
+     and turn an internal table into an undeclared public API. The `StuckSagaResponse`
+     projection can stay stable while the entity changes underneath it.
+   - **Why is a synchronous call acceptable here?** §1's rule protects the *saga
+     workflow*: no business step may block on another service answering, because that
+     reintroduces the temporal coupling the saga pattern exists to remove. The scheduler is
+     not a workflow participant — §4 calls it a liveness mechanism, not a correctness one.
+     No saga waits on this endpoint; if it is unreachable the sweep is merely late, and
+     nothing becomes incorrect. A poll is also genuinely a question rather than a fact, so
+     request/response is the honest shape for it.
+   - **Why not an event?** "Which sagas are stuck right now?" has no natural publisher —
+     nothing *happens* when a deadline passes. Emitting timer ticks to fake one would be
+     more machinery for less clarity.
 2. For each such saga, **acquires a Redis lock keyed by saga id** before doing anything.
    The lock is what makes it safe to run more than one scheduler instance: exactly one
    instance handles a given stuck saga. A saga whose lock cannot be acquired is skipped
@@ -336,17 +384,17 @@ of being an emergent property of who happens to subscribe to what.
 | `order.events.order-confirmed.v1` | order-service — **no producer yet**, see below |
 | `order.events.order-cancelled.v1` | order-service — **no producer yet**, see below |
 
-> **The two terminal-state order topics have no producer as of Chunk 4.** order-service
-> publishes only `OrderCreated`; it consumes `ConfirmOrder` / `CancelOrder` and applies the
-> status change silently. `notification-service` is therefore a complete consumer with
-> nothing yet feeding it, and its `OrderConfirmedEvent` / `OrderCancelledEvent` records are
-> a contract **authored** by Chunk 4 rather than one confirmed against a producer.
+> **The two terminal-state order topics still have no producer as of Chunk 5.**
+> order-service publishes only `OrderCreated`; it consumes `ConfirmOrder` / `CancelOrder`
+> and applies the status change silently. `notification-service` is therefore a complete
+> consumer with nothing feeding it, and its `OrderConfirmedEvent` /
+> `OrderCancelledEvent` records remain a contract **authored** by Chunk 4 rather than one
+> confirmed against a producer.
 >
-> Closing this needs order-service to publish both events when it applies a terminal
-> status. Until then the end-to-end path stops at the order status change, and
-> notification-service is exercised only by tests that publish the events directly — the
-> same way inventory-service and payment-service were built before the orchestrator that
-> commands them existed.
+> Closing this needs **order-service** to publish both events when it applies a terminal
+> status — §3.1 explains why it and not the orchestrator. Deliberately left to its own
+> chunk rather than folded into the orchestrator, where it would have been quick but
+> wrong. Until then the end-to-end path stops at the order status change.
 
 ### 5.3.1 Compensation confirmations are unconditional
 
@@ -615,11 +663,21 @@ Update after every chunk.
       a running system. Its event records are a contract authored here, not confirmed.
       **Caveat:** as with Chunks 1–3, the Testcontainers integration tests are written but
       have never executed — Docker is unreachable from the dev machine (see README).
-- [ ] **Chunk 5 — saga-orchestrator.** `Saga` entity, timeout deadline, and the complete
-      state machine in one pass: consumes `OrderCreated`, issues `ReserveInventory`, then
-      `ProcessPayment` on success, compensation on payment failure, and the
-      `STARTED` / `CONFIRMED` / `COMPENSATING` / `CANCELLED` transitions of §3.
-      *Branch: `feature/saga-orchestrator`.*
+- [x] **Chunk 5 — saga-orchestrator.** `Saga` entity with a configurable timeout deadline,
+      an append-only `saga_steps` history, and the complete state machine of §3 including
+      the `AWAITING_*` states. Consumes `OrderCreated` and all six service replies, and
+      issues every command. Exposes `GET /internal/sagas/stuck` for scheduler-service
+      (§4 explains why REST). *Branch: `feature/saga-orchestrator`.*
+      **Publishes no terminal-state events** — those remain order-service's (§3.1). A
+      draft of this chunk moved them here and was reverted; `OutboundContractTest` now
+      asserts the orchestrator declares no such record, so the boundary fails loudly if
+      reintroduced.
+      **`COMPENSATING` → `CANCELLED` waits for confirmations** rather than marking
+      optimistically — see §3.3.
+      **Not yet idempotent** on the reply side: dedup is Chunk 6. The state-machine guard
+      rejects replies invalid from the current status, which covers the common duplicate,
+      but it is not a substitute for a `processed_messages` table.
+      **No Testcontainers suite** for this module — deliberately, see Chunk 8.
 - [ ] **Chunk 6 — idempotency (orchestrator only).** Dedup on the orchestrator's reply
       side (§6): a duplicated `PaymentCompleted` must not drive a second `OrderConfirmed`.
       inventory-service's landed in Chunk 2 and payment-service's in Chunk 3, so this is

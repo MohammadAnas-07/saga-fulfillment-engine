@@ -1,15 +1,16 @@
 package com.mohammadanas.saga.orchestrator;
 
+import com.mohammadanas.saga.orchestrator.config.SagaProperties;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 
 /**
- * Skeleton entry point for saga-orchestrator.
- *
- * <p>No business logic yet. See ARCHITECTURE.md for this module's responsibility
- * and the chunk checklist entry that fills it in.
+ * Entry point for saga-orchestrator: the only component that decides what happens next in
+ * a saga (ARCHITECTURE.md section 5.1).
  */
 @SpringBootApplication
+@EnableConfigurationProperties(SagaProperties.class)
 public class SagaOrchestratorApplication {
 
     public static void main(String[] args) {
