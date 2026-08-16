@@ -1,0 +1,33 @@
+# Line-ending policy.
+#
+# This file exists because of a real bug, not as boilerplate. `docker/create-topics.sh` was
+# authored on Windows with `core.autocrlf=true`, so Git rewrote it to CRLF on checkout. The
+# script is bind-mounted into a Linux container and run by bash, which reads the trailing
+# `\r` as part of each command and fails with:
+#
+#     /create-topics.sh: line 2: $'\r': command not found
+#
+# kafka-init then exits 2, no topics are created, and every service starts up looking
+# perfectly healthy while consuming nothing — the same silent-failure shape ARCHITECTURE.md
+# 8.4 describes for missing topics.
+#
+# It was invisible to whoever committed it, because the file is LF in the working tree until
+# Git converts it on the *next* checkout. It breaks for the next person to clone, which is
+# the worst way for a bug to be distributed.
+
+# Normalise text files to LF inside the repository. Working-tree endings still follow the
+# developer's platform, which is what most people want for source they edit in an IDE.
+* text=auto
+
+# ...except for anything a Linux container executes or parses. These must be LF in the
+# working tree too, on every machine, regardless of core.autocrlf.
+*.sh    text eol=lf
+*.sql   text eol=lf
+Dockerfile      text eol=lf
+.dockerignore   text eol=lf
+docker-compose.yml text eol=lf
+
+# Binary — never touch these.
+*.jar   binary
+*.png   binary
+*.jpg   binary
