@@ -34,5 +34,15 @@ public enum SagaOutcome {
     IGNORED_REDELIVERY,
 
     /** A reply naming a saga that does not exist. Logged, not thrown, so the consumer cannot spin. */
-    UNKNOWN_SAGA
+    UNKNOWN_SAGA,
+
+    /**
+     * A timeout sweep asked to compensate a saga whose compensation is already underway.
+     *
+     * <p>Not an error and not a rejection: {@code COMPENSATING} is non-terminal, so a saga
+     * that sits there waiting on a confirmation stays visible to the sweep (§4) and will be
+     * offered again on the next pass. Re-issuing the compensating commands would achieve
+     * nothing except a second round of them, so the sweep is told the work is in hand.
+     */
+    ALREADY_COMPENSATING
 }

@@ -43,6 +43,9 @@ public class SagaOrchestrator {
     private static final String PAYMENT_FAILED = "PaymentFailed";
     private static final String PAYMENT_REFUNDED = "PaymentRefunded";
 
+    /** Not a message — the scheduler's REST trigger. Recorded so the history shows why compensation began. */
+    private static final String TIMEOUT_SWEEP = "TimeoutSweep";
+
     private static final Logger log = LoggerFactory.getLogger(SagaOrchestrator.class);
 
     private final SagaRepository sagaRepository;
@@ -270,6 +273,78 @@ public class SagaOrchestrator {
         record(saga, SagaStep.inbound(saga.getId(), PAYMENT_REFUNDED, event.outcome()));
         saga.paymentRefundConfirmed();
         return finishCompensationIfComplete(saga);
+    }
+
+    /**
+     * Drives a timed-out saga into compensation. The entry point scheduler-service calls
+     * once it holds the saga's lock (§4).
+     *
+     * <p>This routes the timeout into the <em>same</em> compensation the explicit failure
+     * path uses — same {@code COMPENSATING} state, same commands, same
+     * outstanding-confirmation flags — rather than inventing a second recovery mechanism.
+     * §4 is explicit that there should be one compensation code path to reason about, and
+     * the scheduler therefore contributes no compensation logic of its own: it decides
+     * <em>when</em>, the orchestrator decides <em>what</em>.
+     *
+     * <p><strong>Which undos are issued depends on where the saga stalled</strong> (§3.4):
+     *
+     * <ul>
+     *   <li>{@code ReleaseInventory} always. The reservation may or may not have happened,
+     *       and the confirmation is unconditional either way (§5.3.1), so issuing it
+     *       blindly cannot deadlock the wait.
+     *   <li>{@code RefundPayment} only from {@code AWAITING_PAYMENT}. That is the §3.5
+     *       case: the charge may have succeeded with its reply lost, so this is the branch
+     *       that actually returns the customer's money. From
+     *       {@code AWAITING_INVENTORY} no payment was ever requested, and asking for a
+     *       refund would be asking payment-service about an order it has never seen.
+     * </ul>
+     *
+     * <p>Not guarded by {@code processed_messages}: this is a REST call, not a broker
+     * message, so there is no message id to dedup on. The guard is the status check below
+     * — a saga already {@code COMPENSATING} or terminal is left alone — backed by the
+     * scheduler's Redis lock, which is what stops two instances arriving here at once.
+     */
+    @Transactional
+    public SagaOutcome compensateTimedOut(UUID sagaId) {
+        Saga saga = load(sagaId);
+        if (saga == null) {
+            return SagaOutcome.UNKNOWN_SAGA;
+        }
+
+        if (saga.getStatus().isTerminal()) {
+            // Common and benign: the saga resolved between the sweep's query and this call.
+            log.info("Ignoring timeout compensation for saga {}: already {}", sagaId, saga.getStatus());
+            return SagaOutcome.IGNORED_INVALID_TRANSITION;
+        }
+
+        if (saga.getStatus() == SagaStatus.COMPENSATING) {
+            log.info("Saga {} is already compensating; leaving it to finish", sagaId);
+            return SagaOutcome.ALREADY_COMPENSATING;
+        }
+
+        SagaStatus stalledIn = saga.getStatus();
+        record(saga, SagaStep.inbound(saga.getId(), TIMEOUT_SWEEP, "stalled in " + stalledIn));
+        transition(saga, SagaStatus.COMPENSATING);
+
+        publisher.releaseInventory(new OutboundMessages.ReleaseInventory(
+                UUID.randomUUID(), saga.getId(), saga.getOrderId()));
+        saga.awaitInventoryRelease();
+        record(saga, SagaStep.outbound(saga.getId(), "ReleaseInventory", "timeout from " + stalledIn));
+
+        if (stalledIn == SagaStatus.AWAITING_PAYMENT) {
+            publisher.refundPayment(new OutboundMessages.RefundPayment(
+                    UUID.randomUUID(), saga.getId(), saga.getOrderId()));
+            saga.awaitPaymentRefund();
+            record(saga, SagaStep.outbound(saga.getId(), "RefundPayment",
+                    "timeout from AWAITING_PAYMENT: the charge may have succeeded with its reply lost"));
+        }
+
+        cancelOrder(saga, "timed out while " + stalledIn);
+
+        sagaRepository.save(saga);
+        log.warn("Saga {} timed out while {} and is now COMPENSATING (order {})",
+                sagaId, stalledIn, saga.getOrderId());
+        return SagaOutcome.ADVANCED;
     }
 
     /**

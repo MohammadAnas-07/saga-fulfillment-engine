@@ -87,6 +87,20 @@ Likely fixes, in order of preference: upgrade Testcontainers past the version th
 supports API 1.55, or enable *Settings → General → Expose daemon on tcp://localhost:2375*
 in Docker Desktop and set `DOCKER_HOST=tcp://localhost:2375`.
 
+### scheduler-service's lock tests need a plain Redis, not Testcontainers
+
+The distributed-lock concurrency tests — the ones proving two scheduler instances cannot
+both compensate the same saga — talk to Redis over a socket rather than through
+Testcontainers, so they run even on this machine. Start one first:
+
+```bash
+docker run -d --rm --name saga-test-redis -p 6379:6379 redis:7-alpine
+```
+
+Point them elsewhere with `REDIS_HOST` / `REDIS_PORT` if you already have one. Without a
+reachable Redis they report as **skipped** (not as zero tests), so the surefire summary
+still tells you they did not run.
+
 ## Running
 
 Not yet runnable — there is no business logic, and the Kafka/Postgres/Redis compose setup

@@ -1,3 +1,33 @@
 spring:
   application:
     name: scheduler-service
+
+  # No web server: this service exposes no endpoints. spring-boot-starter-web is present
+  # only for the RestClient that polls saga-orchestrator.
+  main:
+    web-application-type: none
+
+  quartz:
+    # In-memory schedule per instance, on purpose — see QuartzConfig. Coordination between
+    # instances is the Redis lock's job, per saga, not Quartz clustering's, per trigger.
+    job-store-type: memory
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+
+scheduler:
+  # How often to sweep. Drop it (SCHEDULER_INTERVAL=PT5S) alongside a short SAGA_TIMEOUT
+  # on the orchestrator to watch the timeout path without waiting around.
+  interval: ${SCHEDULER_INTERVAL:PT30S}
+
+  # Must comfortably exceed how long compensating one saga takes -- see SchedulerProperties.
+  lock-ttl: ${SCHEDULER_LOCK_TTL:PT2M}
+
+  orchestrator-base-url: ${ORCHESTRATOR_BASE_URL:http://localhost:8085}
+  request-timeout: ${SCHEDULER_REQUEST_TIMEOUT:PT10S}
+
+logging:
+  level:
+    com.mohammadanas.saga.scheduler: INFO

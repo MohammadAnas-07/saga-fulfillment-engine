@@ -1,8 +1,12 @@
 package com.mohammadanas.saga.orchestrator.api;
 
 import com.mohammadanas.saga.orchestrator.service.SagaOrchestrator;
+import com.mohammadanas.saga.orchestrator.service.SagaOutcome;
 import java.util.List;
+import java.util.UUID;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -45,5 +49,26 @@ public class InternalSagaController {
     @GetMapping("/stuck")
     public List<StuckSagaResponse> stuckSagas() {
         return orchestrator.findStuckSagas().stream().map(StuckSagaResponse::from).toList();
+    }
+
+    /**
+     * Drives one timed-out saga into compensation. Called by scheduler-service, and only
+     * once it holds that saga's Redis lock.
+     *
+     * <p>The decision of <em>what</em> compensating commands to issue stays entirely on
+     * this side — the caller supplies a saga id and nothing else. That is deliberate: §4
+     * requires the timeout path to reuse the same compensation an explicit failure takes,
+     * and the surest way to guarantee that is to give the scheduler no way to express
+     * anything different.
+     *
+     * <p>Always {@code 200} with the outcome in the body, including for an unknown saga.
+     * The scheduler polls a list that can go stale between the query and this call, so
+     * "that saga finished already" is an ordinary answer rather than a client error, and
+     * a 4xx would only invite the scheduler to treat routine races as failures worth
+     * retrying or alerting on.
+     */
+    @PostMapping("/{sagaId}/compensate")
+    public SagaOutcome compensate(@PathVariable UUID sagaId) {
+        return orchestrator.compensateTimedOut(sagaId);
     }
 }

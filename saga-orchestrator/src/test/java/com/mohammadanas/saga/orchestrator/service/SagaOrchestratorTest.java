@@ -530,6 +530,127 @@ class SagaOrchestratorTest {
         }
     }
 
+    /**
+     * The timeout compensation trigger scheduler-service calls (§4).
+     *
+     * <p>What matters here is that a timeout lands in the <em>same</em> compensation an
+     * explicit failure takes — same state, same commands, same outstanding-confirmation
+     * flags — and that which undos get issued depends on where the saga stalled (§3.4).
+     */
+    @Nested
+    @DisplayName("timeout compensation")
+    class TimeoutCompensation {
+
+        @Test
+        @DisplayName("stalled in AWAITING_INVENTORY: releases stock, cancels the order, and asks for no refund")
+        void timeoutFromAwaitingInventory() {
+            Saga saga = sagaIn(SagaStatus.AWAITING_INVENTORY);
+            when(sagaRepository.findById(saga.getId())).thenReturn(Optional.of(saga));
+
+            SagaOutcome outcome = orchestrator.compensateTimedOut(saga.getId());
+
+            assertThat(outcome).isEqualTo(SagaOutcome.ADVANCED);
+            assertThat(saga.getStatus()).isEqualTo(SagaStatus.COMPENSATING);
+            verify(publisher).releaseInventory(any());
+            verify(publisher).cancelOrder(any());
+
+            // No payment was ever requested from this status, so a refund would be asking
+            // payment-service about an order it has never seen.
+            verify(publisher, never()).refundPayment(any());
+            assertThat(saga.isAwaitingInventoryRelease()).isTrue();
+            assertThat(saga.isAwaitingPaymentRefund()).isFalse();
+        }
+
+        @Test
+        @DisplayName("stalled in AWAITING_PAYMENT: also refunds, because the charge may have succeeded")
+        void timeoutFromAwaitingPaymentAlsoRefunds() {
+            Saga saga = sagaIn(SagaStatus.AWAITING_PAYMENT);
+            when(sagaRepository.findById(saga.getId())).thenReturn(Optional.of(saga));
+
+            SagaOutcome outcome = orchestrator.compensateTimedOut(saga.getId());
+
+            assertThat(outcome).isEqualTo(SagaOutcome.ADVANCED);
+            assertThat(saga.getStatus()).isEqualTo(SagaStatus.COMPENSATING);
+
+            // This is the §3.5 case: PaymentCompleted may have been published and lost, so
+            // the money has to be offered back. Without this branch a timeout after a
+            // successful charge would silently keep the customer's money.
+            verify(publisher).releaseInventory(any());
+            verify(publisher).refundPayment(any());
+            verify(publisher).cancelOrder(any());
+            assertThat(saga.isAwaitingInventoryRelease()).isTrue();
+            assertThat(saga.isAwaitingPaymentRefund()).isTrue();
+        }
+
+        @Test
+        @DisplayName("the saga waits for both confirmations before it may reach CANCELLED")
+        void doesNotJumpStraightToCancelled() {
+            Saga saga = sagaIn(SagaStatus.AWAITING_PAYMENT);
+            when(sagaRepository.findById(saga.getId())).thenReturn(Optional.of(saga));
+
+            orchestrator.compensateTimedOut(saga.getId());
+
+            // Marking CANCELLED optimistically here would make COMPENSATING meaningless —
+            // the state exists precisely to say an undo is still outstanding (§3.3).
+            assertThat(saga.getStatus()).isEqualTo(SagaStatus.COMPENSATING);
+            assertThat(saga.compensationComplete()).isFalse();
+        }
+
+        @Test
+        @DisplayName("a saga that finished between the sweep's query and this call is left alone")
+        void terminalSagaIsIgnored() {
+            Saga saga = sagaIn(SagaStatus.CONFIRMED);
+            when(sagaRepository.findById(saga.getId())).thenReturn(Optional.of(saga));
+
+            assertThat(orchestrator.compensateTimedOut(saga.getId()))
+                    .isEqualTo(SagaOutcome.IGNORED_INVALID_TRANSITION);
+            assertThat(saga.getStatus()).isEqualTo(SagaStatus.CONFIRMED);
+            verifyNoInteractions(publisher);
+        }
+
+        @Test
+        @DisplayName("a saga already compensating is not compensated a second time")
+        void alreadyCompensatingIsLeftToFinish() {
+            Saga saga = sagaIn(SagaStatus.COMPENSATING);
+            when(sagaRepository.findById(saga.getId())).thenReturn(Optional.of(saga));
+
+            // COMPENSATING is non-terminal, so it keeps showing up in the sweep until its
+            // confirmations arrive. Re-issuing the commands each pass would achieve nothing
+            // but a second round of them.
+            assertThat(orchestrator.compensateTimedOut(saga.getId()))
+                    .isEqualTo(SagaOutcome.ALREADY_COMPENSATING);
+            verifyNoInteractions(publisher);
+        }
+
+        @Test
+        @DisplayName("an unknown saga id is ignored rather than thrown")
+        void unknownSagaIsIgnored() {
+            UUID unknown = UUID.randomUUID();
+            when(sagaRepository.findById(unknown)).thenReturn(Optional.empty());
+
+            assertThat(orchestrator.compensateTimedOut(unknown)).isEqualTo(SagaOutcome.UNKNOWN_SAGA);
+            verifyNoInteractions(publisher);
+        }
+
+        @Test
+        @DisplayName("the history records that compensation began at a timeout, not a failure")
+        void recordsWhyCompensationBegan() {
+            Saga saga = sagaIn(SagaStatus.AWAITING_PAYMENT);
+            when(sagaRepository.findById(saga.getId())).thenReturn(Optional.of(saga));
+
+            orchestrator.compensateTimedOut(saga.getId());
+
+            ArgumentCaptor<SagaStep> captor = ArgumentCaptor.forClass(SagaStep.class);
+            verify(sagaStepRepository, org.mockito.Mockito.atLeastOnce()).save(captor.capture());
+
+            // An audit trail that cannot distinguish "payment failed" from "nobody ever
+            // replied" cannot explain why a saga was compensated.
+            assertThat(captor.getAllValues())
+                    .extracting(SagaStep::getStep)
+                    .contains("TimeoutSweep");
+        }
+    }
+
     @Nested
     @DisplayName("stuck-saga query")
     class StuckSagas {
