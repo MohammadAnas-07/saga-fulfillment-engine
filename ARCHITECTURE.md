@@ -6,22 +6,28 @@ scheduler that drives timeout-based compensation for sagas that stall.
 This document is the design reference for the project. It is updated in the same commit
 as any change that affects design.
 
-**Status:** Chunks 0–8 complete. **The system is connected end to end**: an order created
-over REST drives the full saga through inventory and payment and back, and the terminal
-outcome reaches the customer as a notification. Every topic in §5.3 has both a producer and
-a consumer, every consumer in the system dedups on message id (§6), and the timeout sweep
-closes the last liveness gap (§4). Chunk 8 proves the chain end to end against real
-infrastructure. What remains is a local run setup (Chunk 9).
+**Status:** Chunks 0–9 complete — the planned build-out is finished. **The system is
+connected end to end**: an order created over REST drives the full saga through inventory
+and payment and back, and the terminal outcome reaches the customer as a notification. Every
+topic in §5.3 has both a producer and a consumer, every consumer dedups on message id (§6),
+and the timeout sweep closes the last liveness gap (§4).
+
+Chunk 8 proves the chain against real infrastructure, and Chunk 9 proves it again in the
+deployment shape: `docker compose up` brings the whole system up and a real order reaches
+`CONFIRMED` with its customer notification.
+
+What remains is **Chunk 10** — fixing the one known defect below.
 
 > **One known open defect:** §8.5 — a compensating `ReleaseInventory` can overtake the
 > stale `ReserveInventory` it compensates, leaking stock on a cancelled order. Found by the
 > end-to-end suite, documented rather than quietly fixed, and not yet addressed.
 
-> **"End to end" here means every link is implemented and unit-tested, not that the whole
-> chain has been observed running.** The Testcontainers suites that would prove that have
-> still never executed on the development machine (Docker is unreachable — see README);
-> the cross-service seam closed in Chunk 5.5 was verified directly instead, in the way that
-> chunk records. Chunk 8 is where "observed running" gets earned.
+> **"End to end" now means observed running, not merely implemented.** For most of this
+> project's history it meant the weaker thing: the Testcontainers suites had never executed
+> because Docker was unreachable, so every link was implemented and unit-tested and the
+> chain as a whole was assumed. Chunk 8 fixed that and immediately found three real defects;
+> Chunk 9 then ran the same paths under `docker compose`. The distinction is kept here
+> because it is the single most important lesson this project produced.
 
 ---
 
@@ -803,6 +809,9 @@ when there is nothing to reverse, and have `reserve` refuse an order that alread
 one. That makes the outcome independent of arrival order, which is the actual requirement —
 the ordering cannot be guaranteed by the broker and should not be assumed.
 
+**Tracked as Chunk 10** in the §10 checklist, so this does not survive only as a paragraph
+in the testing section.
+
 The §8.4 timeout test deliberately does **not** assert stock restoration on this path. It
 asserts what the system genuinely does — the sweep detects the stall, compensation runs,
 the order reaches `CANCELLED`, the customer is notified, and the saga leaves `COMPENSATING`
@@ -1021,5 +1030,50 @@ Update after every chunk.
       concurrent schedulers (5) by Chunk 7's Redis test. **Cases 6 and 7 — a late reply
       after compensation, and a compensation that itself fails — still have no end-to-end
       coverage**, and §8.3 names them as the two most often missed.
-- [ ] **Chunk 9 — local run and docs.** `docker-compose` for Kafka/Postgres/Redis,
-      README run instructions, observability pass.
+- [x] **Chunk 9 — local run and docs.** `docker-compose` for Kafka/Postgres/Redis, README
+      run instructions, observability pass. *Branch: `feature/deployment-ready`.*
+      **One multi-stage `Dockerfile` parameterised by service**, so the reactor is built once
+      and reused for all six images. It copies the `-exec` jar, not the plain one — the
+      classifier split Chunk 8 introduced (§8.4) means picking the wrong jar yields one with
+      no `Main-Class`.
+      **Startup ordering uses real health checks**, never bare `depends_on`, which only waits
+      for a container to start rather than to become answerable. Postgres is polled with
+      `pg_isready`, Kafka is made to answer an actual API call, and the two HTTP services are
+      polled on `/actuator/health` — actuator was added to order-service and saga-orchestrator
+      for exactly that and nothing else.
+      **Topics are created by a one-shot container before any consumer starts**, the same
+      decision the integration suite reached for the same reason (§8.4): the ownership
+      dependency between services is a cycle, and a consumer subscribed to a missing topic
+      waits five minutes for its next metadata refresh while looking perfectly healthy.
+      **One database and one role per service** (§7), enforced by the Postgres init script
+      rather than merely documented — two pairs of services share table names.
+      **Demo stock is seeded by a separate one-shot container** that retries until Hibernate
+      has created the table, rather than by adding a seeding path to inventory-service.
+      Stock levels are operational data; putting the demo into the product would be the
+      wrong trade.
+      **Verified by actually running it**, not just by the file parsing: `docker compose up`
+      brings all six services healthy, and a real `POST /orders` reaches `CONFIRMED` with the
+      customer notification logged and stock moved to 98/2. The payment-failure path was run
+      the same way — `CANCELLED`, stock restored to 50/0, cancellation notification.
+      **README rewritten** as the honest account: what the system is, why the saga and the
+      scheduler are two halves of one guarantee rather than two features, the three demo
+      paths, the scope boundaries, the test numbers, and the §8.5 defect stated plainly in
+      its own section rather than buried.
+- [ ] **Chunk 10 — compensation ordering (§8.5).** Fix the defect the end-to-end suite
+      found in Chunk 8: a compensating `ReleaseInventory` can be consumed before the stale
+      `ReserveInventory` it compensates, because the two are on different topics and §5.4's
+      ordering guarantee holds only within one topic. The order and saga both reach
+      `CANCELLED` while the stock stays reserved forever, and every service believes it
+      behaved correctly.
+      **Tracked separately on purpose.** It changes compensation semantics rather than test
+      infrastructure, so folding it into Chunk 8 would have mixed "prove the system works"
+      with "change how the system works" in one commit. §8.5 holds the evidence — including
+      the 62ms-apart log excerpt — and the candidate fix: have `release` record a tombstone
+      for the order when there is nothing to reverse, and have `reserve` refuse an order
+      that already carries one, so the outcome stops depending on arrival order.
+      **Scope note:** the §8.4 timeout test currently leaves stock restoration unasserted
+      on this path. Fixing the defect means that assertion can be added, and it should be —
+      that test is where the regression would show up.
+      **Also worth folding in:** §8.3 cases 6 and 7 have no end-to-end coverage (a late
+      reply arriving after compensation, and a compensation that itself fails). Both are
+      about the same area of the design, and §8.3 names them as the two most often missed.

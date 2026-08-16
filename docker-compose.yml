@@ -1,0 +1,241 @@
+# The whole system: six services, Postgres, Kafka (KRaft), Redis.
+#
+# Startup ordering is enforced with real health checks and a one-shot topic creator, not
+# bare `depends_on`. `depends_on` alone only waits for a container to *start*, which for
+# Postgres and Kafka means "the process launched", not "it will answer you" — services then
+# come up, fail their first connection, and either crash-loop or sit in a retry backoff that
+# looks like a hang. Every dependency below is either `service_healthy` or
+# `service_completed_successfully`.
+
+name: saga-fulfillment-engine
+
+x-service-base: &service-base
+  build:
+    context: .
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  environment: &kafka-env
+    KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+
+x-db-depends: &db-and-topics-ready
+  postgres:
+    condition: service_healthy
+  kafka-init:
+    condition: service_completed_successfully
+
+services:
+
+  # ----------------------------------------------------------------- infrastructure
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    volumes:
+      # One database and one role per service — see the file for why that is not cosmetic.
+      - ./docker/postgres-init.sql:/docker-entrypoint-initdb.d/10-databases.sql:ro
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      # -U postgres so the check authenticates as a real role rather than the container's
+      # default OS user, which would report ready slightly before it is.
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  kafka:
+    image: apache/kafka:3.8.0
+    # KRaft, no ZooKeeper: one process, one less moving part, and the mode Kafka is
+    # standardising on. The integration suite (ARCHITECTURE.md 8.4) runs the same image.
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Single broker, so nothing can be replicated further than one node.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # Zero rebalance delay: with one consumer per group there is nothing to wait for, and
+      # the default 3s is 3s added to every service's first poll.
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      CLUSTER_ID: saga-fulfillment-engine-1
+    healthcheck:
+      # Asks the broker to actually answer an API call. A port check would pass while the
+      # broker was still loading and reject every request.
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 15s
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # One-shot: creates all 15 topics, then exits 0. Every service waits on it completing.
+  kafka-init:
+    image: apache/kafka:3.8.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    volumes:
+      - ./docker/create-topics.sh:/create-topics.sh:ro
+    entrypoint: ["bash", "/create-topics.sh"]
+    restart: "no"
+
+  # ----------------------------------------------------------------- services
+
+  order-service:
+    <<: *service-base
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: order-service
+    depends_on: *db-and-topics-ready
+    environment:
+      <<: *kafka-env
+      ORDER_DB_URL: jdbc:postgresql://postgres:5432/order_db
+      ORDER_DB_USER: order_service
+      ORDER_DB_PASSWORD: order_service
+      ORDER_SERVICE_PORT: 8081
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8081/actuator/health >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  inventory-service:
+    <<: *service-base
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: inventory-service
+    depends_on: *db-and-topics-ready
+    environment:
+      <<: *kafka-env
+      INVENTORY_DB_URL: jdbc:postgresql://postgres:5432/inventory_db
+      INVENTORY_DB_USER: inventory_service
+      INVENTORY_DB_PASSWORD: inventory_service
+
+  payment-service:
+    <<: *service-base
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: payment-service
+    depends_on: *db-and-topics-ready
+    environment:
+      <<: *kafka-env
+      PAYMENT_DB_URL: jdbc:postgresql://postgres:5432/payment_db
+      PAYMENT_DB_USER: payment_service
+      PAYMENT_DB_PASSWORD: payment_service
+      # Payments strictly above this fail deterministically. Lower it to 0 to make every
+      # payment fail; see the README's failure-path demo.
+      PAYMENT_FAILURE_THRESHOLD: "1000.00"
+
+  notification-service:
+    <<: *service-base
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: notification-service
+    depends_on: *db-and-topics-ready
+    environment:
+      <<: *kafka-env
+      NOTIFICATION_DB_URL: jdbc:postgresql://postgres:5432/notification_db
+      NOTIFICATION_DB_USER: notification_service
+      NOTIFICATION_DB_PASSWORD: notification_service
+
+  saga-orchestrator:
+    <<: *service-base
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: saga-orchestrator
+    depends_on: *db-and-topics-ready
+    environment:
+      <<: *kafka-env
+      SAGA_DB_URL: jdbc:postgresql://postgres:5432/saga_db
+      SAGA_DB_USER: saga_orchestrator
+      SAGA_DB_PASSWORD: saga_orchestrator
+      SAGA_ORCHESTRATOR_PORT: 8085
+      # How long a saga may stay non-terminal before the sweep may compensate it. Drop it
+      # to seconds (SAGA_TIMEOUT=PT20S) to demo the timeout path — see the README.
+      SAGA_TIMEOUT: ${SAGA_TIMEOUT:-PT5M}
+    ports:
+      - "8085:8085"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8085/actuator/health >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  scheduler-service:
+    <<: *service-base
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SERVICE: scheduler-service
+    depends_on:
+      redis:
+        condition: service_healthy
+      # Waits for the orchestrator to be genuinely serving, because the sweep's first act is
+      # to call it. Not fatal if it were not — a failed poll only makes the sweep late (4) —
+      # but there is no reason to start by logging an error.
+      saga-orchestrator:
+        condition: service_healthy
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      ORCHESTRATOR_BASE_URL: http://saga-orchestrator:8085
+      SCHEDULER_INTERVAL: ${SCHEDULER_INTERVAL:-PT30S}
+      SCHEDULER_LOCK_TTL: PT2M
+
+  # One-shot: puts demo stock in, once inventory-service has created its table. Exits 0.
+  inventory-seed:
+    image: postgres:16-alpine
+    depends_on:
+      postgres:
+        condition: service_healthy
+      inventory-service:
+        condition: service_started
+    environment:
+      POSTGRES_HOST: postgres
+      INVENTORY_DB_USER: inventory_service
+      INVENTORY_DB_PASSWORD: inventory_service
+      INVENTORY_DB_NAME: inventory_db
+    volumes:
+      - ./docker/seed-inventory.sh:/seed-inventory.sh:ro
+    entrypoint: ["sh", "/seed-inventory.sh"]
+    restart: "no"
+
+volumes:
+  postgres-data:

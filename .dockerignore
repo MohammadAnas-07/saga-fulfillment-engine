@@ -1,0 +1,12 @@
+# Build output — the image builds its own, and copying host output in would risk shipping a
+# jar that does not match the sources in the image.
+**/target/
+
+.git/
+.gitignore
+.idea/
+*.iml
+
+# Docs are not needed to build a jar.
+*.md
+docker-compose.yml
