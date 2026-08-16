@@ -6,12 +6,12 @@ scheduler that drives timeout-based compensation for sagas that stall.
 This document is the design reference for the project. It is updated in the same commit
 as any change that affects design.
 
-**Status:** Chunks 0–6 complete. **The system is connected end to end**: an order created
+**Status:** Chunks 0–7 complete. **The system is connected end to end**: an order created
 over REST drives the full saga through inventory and payment and back, and the terminal
 outcome reaches the customer as a notification. Every topic in §5.3 has both a producer and
-a consumer, and every consumer in the system now dedups on message id (§6). What remains is
-the timeout sweep (Chunk 7), the integration suite (Chunk 8), and a local run setup
-(Chunk 9).
+a consumer, every consumer in the system dedups on message id (§6), and the timeout sweep
+closes the last liveness gap (§4). What remains is the integration suite (Chunk 8) and a
+local run setup (Chunk 9).
 
 > **"End to end" here means every link is implemented and unit-tested, not that the whole
 > chain has been observed running.** The Testcontainers suites that would prove that have
@@ -246,11 +246,16 @@ Compensating such a saga requires undoing *both* side effects:
 reason: it is reachable from a timeout, so it can genuinely arrive twice, and it can
 arrive for a saga that never paid at all (a no-op, not an error).
 
-> **Added in Chunk 3.** The original §3 described only the two failure paths above and
-> had no refund anywhere, which left the timeout-after-payment case with no way to return
-> the money. The orchestrator work in Chunk 5 has to issue `RefundPayment` whenever it
-> compensates a saga that reached the paid state — that branch does not exist in §3.4's
-> diagram yet and needs adding when the state machine is built.
+> **Added in Chunk 3, and finally wired in Chunk 7.** The original §3 described only the two
+> failure paths above and had no refund anywhere, which left the timeout-after-payment case
+> with no way to return the money. Chunk 5 built the state machine but had no caller for
+> this branch — nothing issued `RefundPayment`, because only a timeout can reach this
+> situation and the timeout sweep did not exist yet.
+>
+> `compensateTimedOut` closes it: a saga stalled in `AWAITING_PAYMENT` gets **both**
+> `ReleaseInventory` and `RefundPayment`, while one stalled in `AWAITING_INVENTORY` gets
+> only the release — no payment was ever requested from that status, so asking for a refund
+> would be asking payment-service about an order it has never seen.
 
 ### 3.4 State machine
 
@@ -330,8 +335,43 @@ inventory stays reserved.
    invent a second recovery mechanism. A timed-out saga is routed into the identical
    `COMPENSATING` transition described in §3.3, so there is one compensation code path
    to reason about and to test.
-4. **Releases the lock.** Locks carry a TTL so a scheduler that dies mid-pass does not
-   wedge a saga permanently.
+
+   Concretely, `POST /internal/sagas/{sagaId}/compensate`. The scheduler sends a saga id
+   and **nothing else**: which compensating commands to issue is decided entirely on the
+   orchestrator side, by `compensateTimedOut`. Giving the scheduler no way to express
+   anything more is what guarantees the timeout path cannot drift away from the explicit
+   one — it is not merely a convention that they stay identical, there is only the one
+   implementation.
+4. **Releases the lock**, in a `finally` — on failure as well as on success. Releasing only
+   after a successful compensation would keep a saga locked for the full TTL every time the
+   orchestrator hiccupped, delaying the retry of exactly the saga that just failed. Locks
+   also carry a TTL, so a scheduler that dies mid-pass does not wedge a saga permanently.
+
+### 4.1 How the lock is built
+
+`SET key token NX PX ttl` to acquire, and a Lua compare-and-delete to release. Both details
+are load-bearing:
+
+- **Acquisition is a single command.** Redis executes `SET ... NX` atomically, so of two
+  instances racing for one saga exactly one gets `true`. A "check whether the key exists,
+  then write it" version is two round trips with a gap in between, and *both* instances win
+  — the failure is silent, and it is the one this chunk's concurrency test is built to
+  catch.
+- **Release is ownership-checked.** A bare `DEL` would be wrong: an instance whose TTL had
+  lapsed would delete the lock its *successor* now holds, and a third instance could then
+  take it while the second was still working. The token proves ownership, and the script
+  compares it before deleting.
+
+**Quartz clustering is deliberately not used.** Quartz can elect a single instance to fire a
+trigger, but that coordinates at the wrong granularity: it would decide who runs *the
+sweep*, leaving every other instance idle in an active/passive pair. §4 wants every instance
+sweeping and coordinating per *saga*, so the work spreads and one slow instance does not
+hold up the rest. Each instance therefore keeps its own in-memory Quartz schedule, and the
+Redis lock is the only thing arbitrating between them.
+
+`@DisallowConcurrentExecution` stops one instance overlapping its own passes if a sweep ever
+outruns the interval. It says nothing about a second instance — that is the lock's job, and
+conflating the two is an easy mistake to make when reading the code.
 
 Design constraints worth stating:
 
@@ -646,7 +686,11 @@ of the following is an explicit, named test case:
    anything.
 5. **Concurrent schedulers on one stuck saga** (§4) → two scheduler instances sweep the
    same saga simultaneously; the Redis lock ensures compensation is triggered exactly
-   once.
+   once. **Done in Chunk 7** and, unusually for this repo, actually executed: it needs only
+   a plain Redis on a port rather than the Testcontainers setup Docker blocks here.
+   16 threads race for one saga id against a real Redis and exactly one wins. The harness
+   was checked against a deliberately broken check-then-set lock first, which lets all 16
+   through — so the test is known to discriminate rather than merely to pass.
 6. **Late reply after compensation** (§4) → a `PaymentCompleted` arrives *after* the
    scheduler already compensated. The saga must not resurrect into `CONFIRMED`.
 7. **Compensation itself fails** → `ReleaseInventory` errors. The saga must remain in
@@ -794,8 +838,27 @@ Update after every chunk.
       database-enforced half of the guarantee (the primary key under genuine concurrency)
       is therefore asserted in design but unverified in execution, exactly as it is in
       Chunks 2 and 3.
-- [ ] **Chunk 7 — scheduler-service.** Timeout sweep, orchestrator query API, Redis
+- [x] **Chunk 7 — scheduler-service.** Timeout sweep, orchestrator query API, Redis
       distributed lock, compensation trigger (§4). *Branch: `feature/scheduler-service`.*
+      **Quartz on a configurable interval** (`scheduler.interval`, default 30s), each
+      instance holding its own in-memory schedule. Quartz clustering was considered and
+      rejected — §4.1 explains why coordinating per *saga* beats coordinating per *trigger*.
+      **The Redis lock is the point of the chunk**, and §4.1 records both load-bearing
+      details: `SET NX PX` for atomic acquisition, Lua compare-and-delete for
+      ownership-checked release. The lock is released in a `finally`, so a failed
+      compensation gives it straight back rather than holding it for the whole TTL.
+      **Compensation is triggered, never implemented here.** The scheduler posts a saga id
+      to `POST /internal/sagas/{sagaId}/compensate` and can express nothing else, so the
+      timeout path is the explicit-failure path by construction rather than by discipline.
+      That endpoint and `compensateTimedOut` are new orchestrator code in this chunk, and
+      they close the §3.5 `RefundPayment` gap that has been open since Chunk 3.
+      **The concurrency test actually ran** — see §8.3 case 5. This is the first chunk
+      since Chunk 0 whose headline guarantee is verified in execution rather than deferred
+      to Chunk 8, because a plain `docker run redis` is reachable here even though
+      Testcontainers is not.
+      **Still unverified:** the sweep against a *real* orchestrator over HTTP. The
+      orchestrator is mocked in `SchedulerWiringTest`; only the Quartz schedule and the
+      Redis lock are real. Chunk 8.
 - [ ] **Chunk 8 — integration test suite.** Testcontainers harness plus all seven
       failure/compensation cases in §8.3.
 - [ ] **Chunk 9 — local run and docs.** `docker-compose` for Kafka/Postgres/Redis,

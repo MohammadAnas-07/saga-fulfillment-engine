@@ -13,6 +13,39 @@
     <artifactId>scheduler-service</artifactId>
     <name>scheduler-service</name>
 
+    <dependencies>
+        <!-- Quartz drives the sweep on a fixed interval (ARCHITECTURE.md section 4). -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-quartz</artifactId>
+        </dependency>
+
+        <!-- Redis holds the per-saga lock that makes multiple scheduler instances safe. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+
+        <!-- Web for the RestClient that polls the orchestrator. This service exposes no
+             endpoints of its own, so the servlet container is not started - see
+             application.yml. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.awaitility</groupId>
+            <artifactId>awaitility</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
     <build>
         <plugins>
             <plugin>
