@@ -49,6 +49,19 @@
             <artifactId>awaitility</artifactId>
             <scope>test</scope>
         </dependency>
+        <!-- NOT test-scoped, deliberately. Every event this service publishes carries an
+             `Instant occurredAt`, and spring-kafka's JsonSerializer registers the Java 8
+             date/time module only if it is on the classpath. Without it, serialization
+             fails at runtime with "Java 8 date/time type java.time.Instant not supported by
+             default" — so this service could not publish a single event.
+
+             Services with spring-boot-starter-web get this transitively via
+             spring-boot-starter-json; the three that are pure Kafka consumers do not, and
+             the gap was invisible until Chunk 8 got the integration tests running. -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.datatype</groupId>
+            <artifactId>jackson-datatype-jsr310</artifactId>
+        </dependency>
         <dependency>
             <groupId>org.springframework.kafka</groupId>
             <artifactId>spring-kafka-test</artifactId>

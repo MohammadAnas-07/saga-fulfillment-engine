@@ -6,12 +6,16 @@ scheduler that drives timeout-based compensation for sagas that stall.
 This document is the design reference for the project. It is updated in the same commit
 as any change that affects design.
 
-**Status:** Chunks 0–7 complete. **The system is connected end to end**: an order created
+**Status:** Chunks 0–8 complete. **The system is connected end to end**: an order created
 over REST drives the full saga through inventory and payment and back, and the terminal
 outcome reaches the customer as a notification. Every topic in §5.3 has both a producer and
 a consumer, every consumer in the system dedups on message id (§6), and the timeout sweep
-closes the last liveness gap (§4). What remains is the integration suite (Chunk 8) and a
-local run setup (Chunk 9).
+closes the last liveness gap (§4). Chunk 8 proves the chain end to end against real
+infrastructure. What remains is a local run setup (Chunk 9).
+
+> **One known open defect:** §8.5 — a compensating `ReleaseInventory` can overtake the
+> stale `ReserveInventory` it compensates, leaking stock on a cancelled order. Found by the
+> end-to-end suite, documented rather than quietly fixed, and not yet addressed.
 
 > **"End to end" here means every link is implemented and unit-tested, not that the whole
 > chain has been observed running.** The Testcontainers suites that would prove that have
@@ -665,6 +669,18 @@ brokers; the redelivery and locking semantics under test only exist in the real 
 
 Covers: publish/consume round-trips, persistence, and Redis lock acquisition/expiry.
 
+> **These did not run at all from Chunk 1 until Chunk 8.** Testcontainers rejected the
+> development machine's Docker daemon, so every one of these classes skipped silently for
+> six chunks while the build stayed green. The cause turned out to be a Testcontainers
+> version too old to negotiate the installed Docker's API version, and a bump from
+> `1.21.0` (the Spring Boot 3.5.0 default) to `1.21.4` fixed it outright — no workaround,
+> no hand-rolled container management. The version is pinned explicitly in the parent pom
+> so a Spring Boot upgrade cannot quietly walk it back.
+>
+> Running them turned up **three real defects that had been sitting in `main`**, described
+> in the Chunk 8 checklist entry. That is the argument for this whole section in one line:
+> a test that has never executed is not evidence of anything.
+
 ### 8.3 Failure and compensation paths — the part that matters
 
 Happy-path tests prove almost nothing about a Saga system. The value of this project is
@@ -677,9 +693,14 @@ of the following is an explicit, named test case:
    `ReleaseInventory` is published, stock returns to its pre-saga level, and the saga
    only then reaches `CANCELLED`. Asserting the intermediate state is the point — a test
    that only checks the final status would pass even if compensation never ran.
+   **Done end to end in Chunk 8** (§8.4), across all six real services: payment declines
+   at 1200.00 against the 1000.00 threshold, stock returns to exactly its pre-saga level,
+   and the customer receives the cancellation message.
 3. **Timeout with no reply** (§4) → a saga is created, the reply is deliberately never
    sent, and the scheduler drives it into the same compensation path. Asserted by
    advancing a controllable clock, not by sleeping.
+   **Done end to end in Chunk 8** (§8.4), by stopping inventory-service's listeners so the
+   reply genuinely never arrives. This is the test that surfaced the §8.5 defect.
 4. **Duplicate command delivery** (§6) → the same `ReserveInventory` / `ProcessPayment`
    is delivered twice; stock is decremented **once** and the customer is charged
    **once**. This test must fail before idempotency is implemented, or it is not testing
@@ -699,6 +720,94 @@ of the following is an explicit, named test case:
 
 Cases 6 and 7 are the ones most often missed, and are the reason the `COMPENSATING`
 state is modelled explicitly rather than collapsed into `CANCELLED`.
+
+### 8.4 End-to-end tests — the whole chain at once
+
+`integration-tests` is a module with no production code whose entire job is to run the
+system as a system. It boots one Kafka, one Postgres, one Redis and **all six services**,
+then drives real orders through them.
+
+**Why it has to exist.** Every other suite proves one service in isolation. Nothing proved
+they talk to each other — and the seams here are exactly where this design is most fragile:
+message contracts are duplicated across module boundaries by choice (§7), the wire is JSON
+resolved against the consumer's declared record with no schema registry, and a mismatch
+surfaces as a `null` field rather than a compile error. Contract tests pin the field names;
+only this suite proves a message actually leaves one service and arrives at the next.
+
+**What is real:** every topic, consumer group, database row and HTTP call. One Postgres
+database per service, because notification-service and saga-orchestrator both own a
+`processed_messages` table and inventory-service and payment-service both own
+`processed_commands` — sharing one database would have them overwriting each other's dedup
+records.
+
+**What is not, stated plainly:** the six services run as six Spring contexts in **one JVM**,
+not six processes. This suite exercises message flows, persistence and the state machine; it
+does not exercise process isolation or independent deployment. The only substitution
+anywhere in it is a controllable `Clock` in the orchestrator, and that replaces a clock, not
+a collaborator.
+
+**How the timeout case avoids a sleep.** inventory-service's Kafka listeners are genuinely
+stopped, so `ReserveInventory` sits unconsumed and the saga really does stall — the §4
+situation of "a consumer is down", not a simulated one. The clock is then advanced past the
+deadline, the scheduler's own sweep picks the saga up unaided, and the listeners are
+restarted so the release is processed for real and the saga can leave `COMPENSATING`. This
+is what §8.3 case 3 means by "advancing a controllable clock, not by sleeping".
+
+**Services must be usable as libraries for this to work.** `spring-boot-maven-plugin`
+would otherwise replace each module's jar with a fat jar whose classes sit under
+`BOOT-INF/classes/`, which compiles fine in the reactor and then fails at runtime with
+`NoClassDefFoundError`. The plugin is configured in the parent pom to attach the runnable
+jar under the `exec` classifier instead, so `module.jar` stays an ordinary library and
+`module-exec.jar` is the one you run.
+
+**Topics are pre-created by the fixture**, before any service starts. Each service declares
+`NewTopic` beans only for topics it *owns*, so whichever starts first subscribes to topics
+that do not exist yet — and the dependency is a cycle, so no start order avoids it. A
+consumer subscribed to a missing topic does not fail; it logs `UNKNOWN_TOPIC_OR_PARTITION`
+and waits for its next metadata refresh, which defaults to **five minutes**. The service
+looks healthy and consumes nothing. Pre-creating also matches what §5.3 already says
+happens in production, where topic creation is an operations concern.
+
+### 8.5 Open defect — compensation can overtake the command it compensates
+
+**Found by §8.4's timeout test, on 2026-08-16. Not yet fixed.**
+
+When a saga times out while `AWAITING_INVENTORY`, the orchestrator issues
+`ReleaseInventory` (§3.4 — issued unconditionally, because the reservation may or may not
+have happened). But the saga is in that state precisely *because* `ReserveInventory` has
+not been consumed yet. Those two commands travel on **different topics**, and §5.4's
+per-saga ordering guarantee — same key, same partition — only holds **within one topic**.
+Nothing orders them relative to each other.
+
+So the compensating command can be consumed first. Observed exactly that, 62ms apart:
+
+```
+12:44:38.066  ReleaseInventory ... no active reservation to reverse; confirming anyway
+12:44:38.128  Reserved 2 of SKU-c46c81b3 for order 1eaa83ee-...  (8 available, 2 reserved)
+12:44:38.194  Saga f6e999d2-... CANCELLED: compensation complete
+```
+
+The release found nothing to reverse and — correctly, per §5.3.1 — confirmed anyway. The
+stale reserve then took the stock. **The order is `CANCELLED`, the saga is `CANCELLED`, and
+two units stay reserved forever.** Stock is leaked, and every participant believes it
+behaved correctly, which is what makes this the interesting kind of bug.
+
+Note what is *not* wrong here: §5.3.1's unconditional confirmation is still right, and
+without it the saga would have stranded in `COMPENSATING` instead. The gap is that
+inventory-service treats each command independently and has no way to know that a release
+it has already handled invalidates a reserve it has not.
+
+**Candidate fix, deliberately not applied in Chunk 8** because it changes compensation
+semantics rather than test infrastructure: have `release` record a tombstone for the order
+when there is nothing to reverse, and have `reserve` refuse an order that already carries
+one. That makes the outcome independent of arrival order, which is the actual requirement —
+the ordering cannot be guaranteed by the broker and should not be assumed.
+
+The §8.4 timeout test deliberately does **not** assert stock restoration on this path. It
+asserts what the system genuinely does — the sweep detects the stall, compensation runs,
+the order reaches `CANCELLED`, the customer is notified, and the saga leaves `COMPENSATING`
+only once the undo is acknowledged. Asserting restoration would be asserting behaviour that
+does not exist; asserting the leak would enshrine it as correct.
 
 ---
 
@@ -855,11 +964,62 @@ Update after every chunk.
       **The concurrency test actually ran** — see §8.3 case 5. This is the first chunk
       since Chunk 0 whose headline guarantee is verified in execution rather than deferred
       to Chunk 8, because a plain `docker run redis` is reachable here even though
-      Testcontainers is not.
+      Testcontainers is not. *(Chunk 8 fixed Testcontainers and moved these tests onto a
+      managed Redis container, so the manual step is gone and they no longer skip.)*
       **Still unverified:** the sweep against a *real* orchestrator over HTTP. The
       orchestrator is mocked in `SchedulerWiringTest`; only the Quartz schedule and the
       Redis lock are real. Chunk 8.
-- [ ] **Chunk 8 — integration test suite.** Testcontainers harness plus all seven
-      failure/compensation cases in §8.3.
+- [x] **Chunk 8 — integration test suite.** Testcontainers harness plus the end-to-end
+      suite. *Branch: `feature/integration-suite`.*
+      **Testcontainers was fixed properly, not worked around.** The blocker since Chunk 1
+      was a version too old to negotiate the installed Docker's API version; `1.21.0` →
+      `1.21.4` resolved it with no workaround, and the version is now pinned in the parent
+      pom so a Spring Boot upgrade cannot walk it back. Chunk 7's manual
+      `docker run` approach was the prepared fallback and turned out not to be needed.
+      **Nothing in the repository skips any more.** Every previously-skipped test runs —
+      across order, inventory, payment and saga-orchestrator — and Chunk 7's Redis lock
+      tests moved off their hand-started container onto a managed one, so `Skipped: 0` now
+      holds in every module. A non-zero skip count is a regression signal rather than the
+      normal state of this build.
+      Running the previously-skipped tests for the first time found **three real defects
+      that had been sitting in `main`**:
+
+      1. **inventory-service and payment-service could not serialize their own events.**
+         Neither has `spring-boot-starter-web`, so neither had `jackson-datatype-jsr310`,
+         and spring-kafka's `JsonSerializer` registers the Java 8 date/time module only if
+         it is on the classpath. Every event they publish carries an `Instant occurredAt`.
+         **This was a production bug, not a test bug** — in a running system neither service
+         could have emitted a single event.
+      2. **notification-service could not deserialize the events it exists to consume**,
+         for the same missing module. It would have failed on every message, silently,
+         visible only in consumer logs.
+      3. Two integration tests could never have passed as written: they autowired an
+         `ObjectMapper` bean that does not exist without the web starter, and
+         notification-service's test published event records through a producer it had
+         never configured a JSON serializer for. Both failed at context load and had done
+         since the day they were written.
+
+      The first two are the argument for this chunk in a sentence: **a test that has never
+      executed is not evidence of anything**, and two of these would have taken the system
+      down in production while every suite reported green.
+      **New `integration-tests` module** — see §8.4 for what it does and, just as
+      importantly, what it does not: six Spring contexts in one JVM rather than six
+      processes, with one substituted `Clock` and nothing else.
+      **Services are now library-usable** (`spring-boot-maven-plugin` attaches the runnable
+      jar under the `exec` classifier), because a module cannot be both a fat jar and a
+      dependency. Chunk 9's run instructions need the `-exec` name.
+      **The end-to-end suite found a fourth defect, and a design one** — §8.5. A
+      compensating `ReleaseInventory` can be consumed before the stale `ReserveInventory`
+      it compensates, because the two are on different topics and §5.4's ordering guarantee
+      is per topic. The order and saga both reach `CANCELLED` while the stock stays
+      reserved forever, with every service believing it behaved correctly.
+      **Left unfixed on purpose:** the fix changes compensation semantics, not test
+      infrastructure, and belongs in a chunk of its own rather than being folded in here.
+      §8.5 records the candidate fix and the evidence.
+      **§8.3 cases 1, 2 and 3 are now covered end to end.** Cases 4-7 remain covered only
+      at the single-service level: duplicate delivery (4) by each service's own suite, and
+      concurrent schedulers (5) by Chunk 7's Redis test. **Cases 6 and 7 — a late reply
+      after compensation, and a compensation that itself fails — still have no end-to-end
+      coverage**, and §8.3 names them as the two most often missed.
 - [ ] **Chunk 9 — local run and docs.** `docker-compose` for Kafka/Postgres/Redis,
       README run instructions, observability pass.

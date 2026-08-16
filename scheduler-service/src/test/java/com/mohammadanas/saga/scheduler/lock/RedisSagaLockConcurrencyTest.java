@@ -3,9 +3,6 @@ package com.mohammadanas.saga.scheduler.lock;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.mohammadanas.saga.scheduler.config.SchedulerProperties;
-import java.io.IOException;
-import java.net.InetSocketAddress;
-import java.net.Socket;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -23,9 +20,12 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.condition.EnabledIf;
 import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactory;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.testcontainers.containers.GenericContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.utility.DockerImageName;
 
 /**
  * <strong>The point of this chunk.</strong> Proves that when several scheduler instances
@@ -38,31 +38,21 @@ import org.springframework.data.redis.core.StringRedisTemplate;
  * than processes is fine: they contend through the same Redis, over the same connection
  * pool, with genuinely concurrent commands, and that is where the arbitration happens.
  *
- * <p><strong>Point it at any reachable Redis</strong> via {@code REDIS_HOST} /
- * {@code REDIS_PORT}, defaulting to {@code localhost:6379}. It skips itself if nothing is
- * listening, so the build stays green on a machine without one — but unlike the
- * Testcontainers suites elsewhere in this repo, it needs only a plain Redis on a port,
- * which is why it was possible to actually execute it here:
- *
- * <pre>{@code docker run -d --rm -p 6379:6379 redis:7-alpine}</pre>
- *
- * <p>The skip is deliberately expressed as {@code @EnabledIf} rather than an assumption
- * inside {@code @BeforeAll}. An aborted container reports "0 tests run", which disappears
- * into a green build; a disabled one is counted and named as <em>skipped</em>. Given the
- * README's standing warning that {@code BUILD SUCCESS} does not prove the infrastructure
- * tests ran, this class should not be able to vanish quietly.
+ * <p><strong>Written in Chunk 7 against a hand-started Redis</strong>, because
+ * Testcontainers could not reach Docker at the time and the alternative was not running
+ * this test at all. Chunk 8 fixed Testcontainers, so the container is managed here now: the
+ * test no longer skips itself, no longer needs a documented manual step, and can no longer
+ * quietly not run.
  */
-@EnabledIf(
-        value = "redisIsReachable",
-        disabledReason = "No Redis on REDIS_HOST:REDIS_PORT (default localhost:6379) — "
-                + "start one with: docker run -d --rm -p 6379:6379 redis:7-alpine")
+@Testcontainers
 class RedisSagaLockConcurrencyTest {
 
     /** Enough contenders that a broken lock is caught reliably, not just occasionally. */
     private static final int CONTENDERS = 16;
 
-    private static final String HOST = System.getenv().getOrDefault("REDIS_HOST", "localhost");
-    private static final int PORT = Integer.parseInt(System.getenv().getOrDefault("REDIS_PORT", "6379"));
+    @Container
+    static final GenericContainer<?> REDIS =
+            new GenericContainer<>(DockerImageName.parse("redis:7-alpine")).withExposedPorts(6379);
 
     private static LettuceConnectionFactory connectionFactory;
     private static StringRedisTemplate redis;
@@ -71,7 +61,7 @@ class RedisSagaLockConcurrencyTest {
 
     @BeforeAll
     static void connect() {
-        connectionFactory = new LettuceConnectionFactory(HOST, PORT);
+        connectionFactory = new LettuceConnectionFactory(REDIS.getHost(), REDIS.getMappedPort(6379));
         connectionFactory.afterPropertiesSet();
 
         redis = new StringRedisTemplate(connectionFactory);
@@ -89,15 +79,6 @@ class RedisSagaLockConcurrencyTest {
     void cleanUpKeys() {
         cleanups.forEach(Runnable::run);
         cleanups.clear();
-    }
-
-    private static boolean redisIsReachable() {
-        try (Socket socket = new Socket()) {
-            socket.connect(new InetSocketAddress(HOST, PORT), 1000);
-            return true;
-        } catch (IOException e) {
-            return false;
-        }
     }
 
     private SagaLock lockWithTtl(Duration ttl) {

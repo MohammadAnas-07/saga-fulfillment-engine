@@ -83,6 +83,17 @@ class NotificationIntegrationTest {
         registry.add("spring.datasource.username", POSTGRES::getUsername);
         registry.add("spring.datasource.password", POSTGRES::getPassword);
         registry.add("spring.kafka.bootstrap-servers", KAFKA::getBootstrapServers);
+
+        // notification-service is a pure consumer and configures no producer at all, so the
+        // value serializer defaults to StringSerializer and cannot serialize an event
+        // record. This test has to stand in for order-service, so it configures the
+        // producer the way order-service really does: JSON, with type headers off, since
+        // the contract is the topic plus the listener's declared record (section 5.3).
+        //
+        // Needed from the day this class was written; invisible until Chunk 8 made it run.
+        registry.add("spring.kafka.producer.value-serializer",
+                () -> "org.springframework.kafka.support.serializer.JsonSerializer");
+        registry.add("spring.kafka.producer.properties.spring.json.add.type.headers", () -> "false");
     }
 
     /** Captures what would have been delivered, and declares the topics we publish into. */

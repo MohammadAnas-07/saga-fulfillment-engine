@@ -9,20 +9,23 @@ import static org.mockito.Mockito.when;
 
 import com.mohammadanas.saga.scheduler.orchestrator.OrchestratorClient;
 import com.mohammadanas.saga.scheduler.orchestrator.StuckSaga;
-import java.io.IOException;
-import java.net.InetSocketAddress;
-import java.net.Socket;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.condition.EnabledIf;
+
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.TestPropertySource;
+import org.testcontainers.containers.GenericContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.utility.DockerImageName;
 
 /**
  * Proves the Quartz wiring actually schedules and fires the sweep.
@@ -33,7 +36,7 @@ import org.springframework.test.context.TestPropertySource;
  * test in this module green while the service did nothing at all in production.
  *
  * <p>The orchestrator is mocked; this is about the schedule, not the conversation. Redis is
- * real (and the test skips without it), because the sweep resolves a genuine
+ * real — in a container since Chunk 8 — because the sweep resolves a genuine
  * {@code RedisSagaLock} on its way through.
  */
 @SpringBootTest
@@ -42,29 +45,24 @@ import org.springframework.test.context.TestPropertySource;
         "scheduler.interval=PT1S",
         "scheduler.lock-ttl=PT10S"
 })
-@EnabledIf(
-        value = "redisIsReachable",
-        disabledReason = "No Redis on REDIS_HOST:REDIS_PORT (default localhost:6379) — "
-                + "start one with: docker run -d --rm -p 6379:6379 redis:7-alpine")
+@Testcontainers
 class SchedulerWiringTest {
+
+    @Container
+    static final GenericContainer<?> REDIS =
+            new GenericContainer<>(DockerImageName.parse("redis:7-alpine")).withExposedPorts(6379);
+
+    @DynamicPropertySource
+    static void redisProperties(DynamicPropertyRegistry registry) {
+        registry.add("spring.data.redis.host", REDIS::getHost);
+        registry.add("spring.data.redis.port", () -> REDIS.getMappedPort(6379));
+    }
 
     @MockBean
     private OrchestratorClient orchestratorClient;
 
     @Autowired
     private org.quartz.Scheduler quartzScheduler;
-
-    /** Reported as skipped rather than as zero tests — see {@code RedisSagaLockConcurrencyTest}. */
-    static boolean redisIsReachable() {
-        String host = System.getenv().getOrDefault("REDIS_HOST", "localhost");
-        int port = Integer.parseInt(System.getenv().getOrDefault("REDIS_PORT", "6379"));
-        try (Socket socket = new Socket()) {
-            socket.connect(new InetSocketAddress(host, port), 1000);
-            return true;
-        } catch (IOException e) {
-            return false;
-        }
-    }
 
     @Test
     @DisplayName("Quartz fires the sweep on the configured interval without anyone calling it")

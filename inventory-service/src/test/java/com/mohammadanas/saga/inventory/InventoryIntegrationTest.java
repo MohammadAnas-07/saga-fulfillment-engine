@@ -4,6 +4,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.json.JsonMapper;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.mohammadanas.saga.inventory.domain.Inventory;
 import com.mohammadanas.saga.inventory.domain.InventoryRepository;
 import com.mohammadanas.saga.inventory.domain.ProcessedCommandRepository;
@@ -87,8 +89,19 @@ class InventoryIntegrationTest {
     @Autowired
     private KafkaTemplate<String, Object> kafkaTemplate;
 
-    @Autowired
-    private ObjectMapper objectMapper;
+    /**
+     * Built here rather than autowired.
+     *
+     * <p>inventory-service has no {@code spring-boot-starter-web}, so Jackson's
+     * auto-configuration never runs and there is no {@code ObjectMapper} bean to inject —
+     * only the jackson-databind classes that spring-kafka brings in. This class previously
+     * autowired one, which compiled fine and failed at context load; it went unnoticed
+     * because Docker was unreachable and the whole class was skipped from the day it was
+     * written (Chunk 2) until Chunk 8. Constructing it explicitly also documents the
+     * settings the assertions depend on.
+     */
+    private static final ObjectMapper objectMapper =
+            JsonMapper.builder().addModule(new JavaTimeModule()).build();
 
     @DynamicPropertySource
     static void containerProperties(DynamicPropertyRegistry registry) {
