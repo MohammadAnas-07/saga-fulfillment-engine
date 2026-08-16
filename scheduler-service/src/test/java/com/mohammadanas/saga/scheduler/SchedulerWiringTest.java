@@ -18,7 +18,7 @@ import org.junit.jupiter.api.Test;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.TestPropertySource;
@@ -48,9 +48,23 @@ import org.testcontainers.utility.DockerImageName;
 @Testcontainers
 class SchedulerWiringTest {
 
+    /**
+     * Assigned straight from the constructor, then configured — rather than
+     * {@code new GenericContainer<>(...).withExposedPorts(...)} as a single expression.
+     *
+     * <p>A container is {@code AutoCloseable}, and in the chained form the constructor's
+     * result is handed to a method before anything holds it, so static analysis cannot see
+     * that it is ever owned or closed. It always was — {@code @Testcontainers} stops a
+     * {@code @Container} static field after the class finishes — but the warning was
+     * pointing at a shape worth not writing, not at a false alarm worth suppressing.
+     */
     @Container
     static final GenericContainer<?> REDIS =
-            new GenericContainer<>(DockerImageName.parse("redis:7-alpine")).withExposedPorts(6379);
+            new GenericContainer<>(DockerImageName.parse("redis:7-alpine"));
+
+    static {
+        REDIS.addExposedPort(6379);
+    }
 
     @DynamicPropertySource
     static void redisProperties(DynamicPropertyRegistry registry) {
@@ -58,7 +72,13 @@ class SchedulerWiringTest {
         registry.add("spring.data.redis.port", () -> REDIS.getMappedPort(6379));
     }
 
-    @MockBean
+    /**
+     * {@code @MockitoBean}, not {@code @MockBean}: the latter is deprecated in favour of
+     * Spring Framework's own bean-override support, which Spring Boot 3.4 adopted. Same
+     * behaviour here — the real {@code OrchestratorClient} bean is replaced by a mock for
+     * this context — but it is the supported annotation going forward.
+     */
+    @MockitoBean
     private OrchestratorClient orchestratorClient;
 
     @Autowired

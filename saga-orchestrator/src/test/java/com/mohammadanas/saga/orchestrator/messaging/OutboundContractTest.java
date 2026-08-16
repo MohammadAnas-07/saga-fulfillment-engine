@@ -6,7 +6,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.json.JsonMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import java.math.BigDecimal;
-import java.time.Instant;
 import java.util.UUID;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -32,7 +31,12 @@ class OutboundContractTest {
             JsonMapper.builder().addModule(new JavaTimeModule()).build();
 
     private static final UUID ID = UUID.randomUUID();
-    private static final Instant NOW = Instant.parse("2026-08-15T10:00:00Z");
+
+    // No timestamp constant here, deliberately. Every message this class covers is a
+    // *command*, and none of them carries an occurredAt — announcing facts is the owning
+    // service's job (section 3.1), so the orchestrator publishes no events and has nothing
+    // to stamp. A leftover NOW constant sat here unused until Chunk 11; it was never
+    // usable, not merely unused.
 
     private static java.util.Set<String> fieldsOf(Object payload) throws Exception {
         return MAPPER.readTree(MAPPER.writeValueAsString(payload)).properties().stream()

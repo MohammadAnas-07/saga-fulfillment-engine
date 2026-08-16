@@ -50,9 +50,20 @@ class RedisSagaLockConcurrencyTest {
     /** Enough contenders that a broken lock is caught reliably, not just occasionally. */
     private static final int CONTENDERS = 16;
 
+    /**
+     * Assigned straight from the constructor, then configured. In the chained form
+     * {@code new GenericContainer<>(...).withExposedPorts(...)} the constructor's result —
+     * an {@code AutoCloseable} — is passed to a method before anything holds it, so static
+     * analysis cannot see it owned or closed. {@code @Testcontainers} does stop it after the
+     * class, but the shape is worth not writing.
+     */
     @Container
     static final GenericContainer<?> REDIS =
-            new GenericContainer<>(DockerImageName.parse("redis:7-alpine")).withExposedPorts(6379);
+            new GenericContainer<>(DockerImageName.parse("redis:7-alpine"));
+
+    static {
+        REDIS.addExposedPort(6379);
+    }
 
     private static LettuceConnectionFactory connectionFactory;
     private static StringRedisTemplate redis;
