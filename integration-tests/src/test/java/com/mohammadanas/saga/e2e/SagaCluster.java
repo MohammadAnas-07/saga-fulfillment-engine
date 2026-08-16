@@ -107,33 +107,52 @@ public final class SagaCluster {
             return;
         }
 
-        startInfrastructure();
-        createTopics();
-        createDatabases();
+        // Everything from here owns a real resource, and a failure part-way through would
+        // otherwise leave containers and Spring contexts running with nothing holding a
+        // reference to them: `started` would still be false, so stop() would decline to do
+        // anything, and @AfterAll would clean up nothing. Testcontainers' Ryuk would
+        // eventually reap the containers, but the JVM would sit there with half a cluster
+        // in it for the rest of the run.
+        try {
+            startInfrastructure();
+            createTopics();
+            createDatabases();
 
-        orderService = boot(OrderServiceApplication.class, "order-service", orderProperties(), true);
-        inventoryService = boot(InventoryServiceApplication.class, "inventory-service",
-                inventoryProperties(), false);
-        paymentService = boot(PaymentServiceApplication.class, "payment-service", paymentProperties(), false);
-        notificationService = boot(NotificationServiceApplication.class, "notification-service",
-                notificationProperties(), false);
+            orderService = boot(OrderServiceApplication.class, "order-service", orderProperties(), true);
+            inventoryService = boot(InventoryServiceApplication.class, "inventory-service",
+                    inventoryProperties(), false);
+            paymentService = boot(PaymentServiceApplication.class, "payment-service", paymentProperties(), false);
+            notificationService = boot(NotificationServiceApplication.class, "notification-service",
+                    notificationProperties(), false);
 
-        // The orchestrator takes an extra source so its Clock can be the test's.
-        orchestratorService = new SpringApplicationBuilder(
-                SagaOrchestratorApplication.class, ControllableClockConfig.class)
-                .web(WebApplicationType.SERVLET)
-                .properties(orchestratorProperties())
-                .run();
+            // The orchestrator takes an extra source so its Clock can be the test's.
+            orchestratorService = new SpringApplicationBuilder(
+                    SagaOrchestratorApplication.class, ControllableClockConfig.class)
+                    .web(WebApplicationType.SERVLET)
+                    .properties(orchestratorProperties())
+                    .run();
 
-        // Scheduler last: it needs the orchestrator's actual port.
-        schedulerService = boot(SchedulerServiceApplication.class, "scheduler-service",
-                schedulerProperties(port(orchestratorService)), false);
+            // Scheduler last: it needs the orchestrator's actual port.
+            schedulerService = boot(SchedulerServiceApplication.class, "scheduler-service",
+                    schedulerProperties(port(orchestratorService)), false);
 
-        // Only now, once every context is up. Each Spring Boot startup re-initialises the
-        // Logback context, which resets its loggers and discards any appender attached
-        // beforehand — so capturing earlier silently captures nothing, and the assertions
-        // fail against an empty list while the messages are plainly there in the output.
-        captureNotificationLog();
+            // Only now, once every context is up. Each Spring Boot startup re-initialises the
+            // Logback context, which resets its loggers and discards any appender attached
+            // beforehand — so capturing earlier silently captures nothing, and the assertions
+            // fail against an empty list while the messages are plainly there in the output.
+            captureNotificationLog();
+        } catch (RuntimeException | Error e) {
+            // Tear down whatever did come up, then let the original failure surface — the
+            // reason the cluster would not start is far more useful than anything thrown
+            // while cleaning up after it.
+            started = true;
+            try {
+                stop();
+            } catch (RuntimeException | Error cleanupFailure) {
+                e.addSuppressed(cleanupFailure);
+            }
+            throw e;
+        }
 
         started = true;
         Runtime.getRuntime().addShutdownHook(new Thread(SagaCluster::stop));
@@ -142,7 +161,15 @@ public final class SagaCluster {
     private static void startInfrastructure() {
         postgres = new PostgreSQLContainer<>(POSTGRES_IMAGE);
         kafka = new KafkaContainer(KAFKA_IMAGE);
-        redis = new GenericContainer<>(REDIS_IMAGE).withExposedPorts(6379);
+
+        // Assigned from the constructor first, then configured. Written as
+        // `new GenericContainer<>(...).withExposedPorts(...)` the constructor's result — an
+        // AutoCloseable — is handed to a method before any field holds it, so nothing can
+        // see that it is owned. Unlike the @Container fields elsewhere, these containers
+        // have no framework managing them: stop() is the only thing that closes them, which
+        // makes clear ownership from the first statement worth having.
+        redis = new GenericContainer<>(REDIS_IMAGE);
+        redis.addExposedPort(6379);
 
         postgres.start();
         kafka.start();
