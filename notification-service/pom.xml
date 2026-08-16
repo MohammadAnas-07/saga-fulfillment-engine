@@ -24,6 +24,20 @@
             <groupId>org.springframework.kafka</groupId>
             <artifactId>spring-kafka</artifactId>
         </dependency>
+        <!-- Both events this service consumes carry an `Instant occurredAt`, and
+             spring-kafka's message converter registers the Java 8 date/time module only if
+             it is on the classpath. Without it, notification-service cannot deserialize a
+             single message it exists to handle — it would fail on every event, in
+             production, silently until someone read the consumer logs.
+
+             Services with spring-boot-starter-web get this transitively via
+             spring-boot-starter-json; this one has no web starter, and the gap was
+             invisible while its integration tests were being skipped (Chunks 4-7). -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.datatype</groupId>
+            <artifactId>jackson-datatype-jsr310</artifactId>
+        </dependency>
+
         <dependency>
             <groupId>org.postgresql</groupId>
             <artifactId>postgresql</artifactId>

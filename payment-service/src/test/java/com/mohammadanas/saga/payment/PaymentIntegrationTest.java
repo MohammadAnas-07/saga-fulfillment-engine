@@ -4,6 +4,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.json.JsonMapper;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.mohammadanas.saga.payment.domain.Payment;
 import com.mohammadanas.saga.payment.domain.PaymentRepository;
 import com.mohammadanas.saga.payment.domain.PaymentStatus;
@@ -82,8 +84,15 @@ class PaymentIntegrationTest {
     @Autowired
     private KafkaTemplate<String, Object> kafkaTemplate;
 
-    @Autowired
-    private ObjectMapper objectMapper;
+    /**
+     * Built here rather than autowired — payment-service has no
+     * {@code spring-boot-starter-web}, so there is no auto-configured
+     * {@code ObjectMapper} bean. See the same note on inventory-service's integration test:
+     * this failed at context load from the day it was written and was invisible while the
+     * class was being skipped.
+     */
+    private static final ObjectMapper objectMapper =
+            JsonMapper.builder().addModule(new JavaTimeModule()).build();
 
     @DynamicPropertySource
     static void containerProperties(DynamicPropertyRegistry registry) {

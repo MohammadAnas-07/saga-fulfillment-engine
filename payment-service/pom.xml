@@ -49,6 +49,13 @@
             <artifactId>awaitility</artifactId>
             <scope>test</scope>
         </dependency>
+        <!-- Runtime, not test — see the note in inventory-service's pom. Every event this
+             service publishes carries an `Instant occurredAt`, and without this module
+             spring-kafka's JsonSerializer cannot write it. -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.datatype</groupId>
+            <artifactId>jackson-datatype-jsr310</artifactId>
+        </dependency>
         <dependency>
             <groupId>org.springframework.kafka</groupId>
             <artifactId>spring-kafka-test</artifactId>

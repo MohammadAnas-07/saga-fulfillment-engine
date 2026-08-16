@@ -79,29 +79,75 @@ reachable Docker daemon.
 > **Integration tests skip silently when Docker is unreachable.** `BUILD SUCCESS` alone
 > does not mean they ran — check the surefire summary for a non-zero `Skipped` count.
 
-Known issue on the current development machine: Docker Desktop's engine (API 1.55)
-returns a stubbed `400` on `/info` to docker-java, so Testcontainers rejects the
-environment even though the `docker` CLI works normally. Neither `DOCKER_HOST` pointed at
-`npipe:////./pipe/dockerDesktopLinuxEngine` nor pinning `DOCKER_API_VERSION=1.44` helped.
-Likely fixes, in order of preference: upgrade Testcontainers past the version that
-supports API 1.55, or enable *Settings → General → Expose daemon on tcp://localhost:2375*
-in Docker Desktop and set `DOCKER_HOST=tcp://localhost:2375`.
+### The Testcontainers problem is fixed (Chunk 8)
 
-### scheduler-service's lock tests need a plain Redis, not Testcontainers
+From Chunk 1 to Chunk 7 the integration tests **never executed once**. Docker Desktop's
+engine returned a stubbed `400` on `/info` to docker-java, so Testcontainers rejected the
+environment even though the `docker` CLI worked normally, and every one of those classes
+skipped while the build stayed green.
 
-The distributed-lock concurrency tests — the ones proving two scheduler instances cannot
-both compensate the same saga — talk to Redis over a socket rather than through
-Testcontainers, so they run even on this machine. Start one first:
+The cause was simply a **Testcontainers version too old to negotiate the installed
+Docker's API version**. Bumping `1.21.0` (Spring Boot 3.5.0's default) to `1.21.4` fixed it
+outright — no `DOCKER_HOST` juggling, no `DOCKER_API_VERSION` pinning, no hand-rolled
+container management. The version is pinned explicitly in the parent pom so a future Spring
+Boot upgrade cannot silently walk it back:
 
-```bash
-docker run -d --rm --name saga-test-redis -p 6379:6379 redis:7-alpine
+```xml
+<testcontainers.version>1.21.4</testcontainers.version>
 ```
 
-Point them elsewhere with `REDIS_HOST` / `REDIS_PORT` if you already have one. Without a
-reachable Redis they report as **skipped** (not as zero tests), so the surefire summary
-still tells you they did not run.
+Running those tests for the first time surfaced **three real defects** that had been sitting
+in `main` — see the Chunk 8 entry in [ARCHITECTURE.md](ARCHITECTURE.md). Two of them would
+have broken the system in production, not just in tests: three services could not serialize
+or deserialize their own wire messages, because `jackson-datatype-jsr310` was missing and
+every message carries an `Instant`.
+
+### What is now genuinely verified, and what still is not
+
+**Verified end to end, all six services running against real Kafka/Postgres/Redis**
+(`integration-tests`, see ARCHITECTURE.md §8.4):
+
+- the happy path, from `POST /orders` to the customer notification
+- payment failure → compensation → stock restored → order `CANCELLED` → customer notified
+- timeout → scheduler sweep → compensation → order `CANCELLED` → customer notified
+
+**Not verified, and worth knowing before trusting the suite:**
+
+- **Process isolation.** The six services run as six Spring contexts in one JVM, not six
+  processes. Message flows, persistence and the state machine are real; independent
+  deployment and mid-saga process death are not exercised.
+- **§8.3 cases 6 and 7** — a late reply arriving after compensation, and a compensation that
+  itself fails — have no end-to-end coverage. §8.3 itself calls these the two most often
+  missed.
+- **One open defect, found by these tests and not yet fixed:** ARCHITECTURE.md §8.5. A
+  compensating `ReleaseInventory` can overtake the stale `ReserveInventory` it compensates,
+  leaking stock on a cancelled order while every service believes it behaved correctly.
+
+### Nothing skips any more
+
+`mvn test` now runs **every** test in the repository, with `Skipped: 0` in every module.
+There is no manual setup step and no test that quietly opts itself out.
+
+scheduler-service's distributed-lock tests used to be the exception: written in Chunk 7
+against a hand-started `docker run redis`, because Testcontainers could not reach Docker
+then and the alternative was not testing the lock at all. Chunk 8 fixed Testcontainers, so
+those tests manage their own Redis container like everything else.
+
+If you see a non-zero `Skipped` count, something has regressed — that is now a signal
+rather than the normal state of this build.
 
 ## Running
 
-Not yet runnable — there is no business logic, and the Kafka/Postgres/Redis compose setup
-lands in a later chunk. See the checklist in [ARCHITECTURE.md](ARCHITECTURE.md).
+The `docker-compose` setup for Kafka/Postgres/Redis and proper run instructions land in
+Chunk 9. Until then, the end-to-end suite is the way to see the whole system actually work
+— it starts every dependency and all six services for you:
+
+```bash
+mvn -pl integration-tests -am test
+```
+
+**Note on jar names.** Each service builds two artifacts: `<module>.jar` is an ordinary
+library jar, and **`<module>-exec.jar` is the runnable one**. The `exec` classifier exists
+because `integration-tests` depends on the services as libraries, and a Spring Boot fat jar
+cannot serve both purposes — see ARCHITECTURE.md §8.4. Chunk 9's run commands need the
+`-exec` name.
